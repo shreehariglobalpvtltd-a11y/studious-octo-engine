@@ -17,6 +17,10 @@ set -euo pipefail
 
 SITE="${1:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Works from the git repo (site/, patches/) and from the download zip
+# (1-upload-to-public_html/, 2-menu/).
+SRC="$HERE/site";                      [ -d "$SRC" ]   || SRC="$HERE/1-upload-to-public_html"
+PATCH="$HERE/patches/admin-nav.patch"; [ -f "$PATCH" ] || PATCH="$HERE/2-menu/admin-nav.patch"
 
 if [ -z "$SITE" ] || [ ! -f "$SITE/includes/bootstrap.php" ] || [ ! -f "$SITE/admin/_guard.php" ]; then
   echo "usage: bash tools/install.sh /path/to/website   (the folder that has includes/ and admin/)" >&2
@@ -24,7 +28,7 @@ if [ -z "$SITE" ] || [ ! -f "$SITE/includes/bootstrap.php" ] || [ ! -f "$SITE/ad
 fi
 
 echo "== 1. Copying files into $SITE"
-cd "$HERE/site"
+cd "$SRC"
 COPIED=()
 while IFS= read -r -d '' f; do
   rel="${f#./}"
@@ -42,11 +46,11 @@ done < <(find . -type f -print0 | sort -z)
 echo "== 2. Adding the menu items (admin/_guard.php)"
 if grep -q "live-fleet.php" "$SITE/admin/_guard.php"; then
   echo "   already there"
-elif (cd "$SITE" && patch -p1 --dry-run --silent < "$HERE/patches/admin-nav.patch" >/dev/null 2>&1); then
-  (cd "$SITE" && patch -p1 --silent < "$HERE/patches/admin-nav.patch")
+elif (cd "$SITE" && patch -p1 --dry-run --silent < "$PATCH" >/dev/null 2>&1); then
+  (cd "$SITE" && patch -p1 --silent < "$PATCH")
   echo "   added: Live Fleet · TV Wall · Driver Login & CCTV"
 else
-  echo "   could not patch automatically — add the 5 lines from patches/admin-nav.patch by hand" >&2
+  echo "   could not patch automatically — paste the 5 lines from 2-menu/MENU-5-LINES.txt by hand (docs/INSTALL-NEPALI.md, step 2)" >&2
 fi
 
 # On the server the web files belong to www-data (see the site's CLAUDE.md).
@@ -57,7 +61,7 @@ fi
 cat <<EOF
 
 == 3. Still to do
-   a) Database (adds 5 new tables, changes nothing that exists):
+   a) Database (adds 6 new tables, changes nothing that exists):
         cd "$SITE" && php tests/apply-sql.php database/upgrade-2026-10-live-fleet.sql
 
    b) Hourly cleanup (crontab -e):

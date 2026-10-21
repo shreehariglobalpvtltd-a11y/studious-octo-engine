@@ -51,6 +51,15 @@ final class LiveFleet
     public const DEVICE_IDLE_DAYS = 60;
     /** How often the legacy `livebus` key is refreshed. */
     public const MIRROR_SECONDS = 10;
+    /** Straight line between stops × this ≈ road km (the same factor as EtaAlerts). */
+    public const ROAD_FACTOR = 1.25;
+    /** Town / temple names are cached per square of this many degrees (~20 km)… */
+    public const CELL_DEG = 0.2;
+    /** …fetched with this much margin, so a bus near the edge still sees across it. */
+    public const CELL_PAD = 0.05;
+    /** A failed fetch is retried after an hour; good data is kept 90 days. */
+    public const CELL_RETRY_SECONDS = 3600;
+    public const CELL_KEEP_DAYS = 90;
 
     public const CAMERA_KINDS = [
         'hls'      => 'HLS video (.m3u8)',
@@ -436,6 +445,7 @@ final class LiveFleet
             ? ['lat' => (float) $trip['last_lat'], 'lng' => (float) $trip['last_lng'], 'ts' => $lastFix, 'acc' => (float) ($trip['last_accuracy_m'] ?? 0)]
             : null;
         $lastTrail = $trip['last_trail_at'] !== null ? (int) strtotime((string) $trip['last_trail_at']) : 0;
+        $avg = $trip['avg_speed_kmh'] !== null ? (float) $trip['avg_speed_kmh'] : null;
         $addKm = 0.0;
         $trail = [];
         foreach ($clean as $i => $pt) {
@@ -450,6 +460,11 @@ final class LiveFleet
                     $addKm += $km;
                 }
             }
+            // The ETA speed: an average over the last minute or two of MOVING,
+            // so a tea stop does not make the next town "hours away".
+            if ($pt['kmh'] !== null && $pt['kmh'] >= 8 && $pt['kmh'] <= self::MAX_SPEED_KMH) {
+                $avg = $avg === null ? $pt['kmh'] : $avg + 0.02 * ($pt['kmh'] - $avg);
+            }
             $sec = intdiv($pt['ts'], 1000);
             if ($sec - $lastTrail >= self::TRAIL_SECONDS) {
                 $trail[]   = $pt;
@@ -459,7 +474,7 @@ final class LiveFleet
         }
         $last = end($clean);
 
-        Database::transaction(static function () use ($trip, $trail, $last, $addKm, $clean, $battery, $nowTs, $lastTrail): void {
+        Database::transaction(static function () use ($trip, $trail, $last, $addKm, $clean, $battery, $nowTs, $lastTrail, $avg): void {
             if ($trail !== []) {
                 $rows = [];
                 $args = [];
@@ -471,10 +486,10 @@ final class LiveFleet
                 Database::query('INSERT INTO fleet_points (trip_id, lat, lng, speed_kmh, heading, accuracy_m, recorded_at) VALUES ' . implode(',', $rows), $args);
             }
             Database::query(
-                'UPDATE fleet_trips SET last_lat = :la, last_lng = :ln, last_speed_kmh = :s, last_heading = :h, last_accuracy_m = :a,
+                'UPDATE fleet_trips SET last_lat = :la, last_lng = :ln, last_speed_kmh = :s, avg_speed_kmh = :avg, last_heading = :h, last_accuracy_m = :a,
                         last_fix_at = :f, last_ping_at = :p, last_trail_at = :lt, distance_km = distance_km + :km, points = points + :n'
                 . ($battery !== null ? ', last_battery = :bat' : '') . ' WHERE id = :id',
-                ['la' => $last['lat'], 'ln' => $last['lng'], 's' => $last['kmh'], 'h' => $last['hdg'], 'a' => $last['acc'],
+                ['la' => $last['lat'], 'ln' => $last['lng'], 's' => $last['kmh'], 'avg' => $avg !== null ? round($avg, 1) : null, 'h' => $last['hdg'], 'a' => $last['acc'],
                  'f' => date('Y-m-d H:i:s', intdiv($last['ts'], 1000)), 'p' => date('Y-m-d H:i:s', $nowTs),
                  'lt' => $lastTrail > 0 ? date('Y-m-d H:i:s', $lastTrail) : null, 'km' => round($addKm, 3), 'n' => count($clean), 'id' => (int) $trip['id']]
                 + ($battery !== null ? ['bat' => max(0, min(100, $battery))] : [])
@@ -579,7 +594,7 @@ final class LiveFleet
      * Every active bus with its running trip — or, when parked, where its
      * last trip ended. One query; the 1-second refresh depends on it.
      *
-     * @return array{now:int, buses:list<array<string,mixed>>, counts:array<string,int>}
+     * @return array{now:int, buses:list<array<string,mixed>>, counts:array<string,int>, need_cells:list<string>}
      */
     public static function snapshot(bool $withCameras = true, ?int $nowTs = null): array
     {
@@ -587,7 +602,7 @@ final class LiveFleet
         $rows = Database::fetchAll(
             "SELECT b.id AS bus_id, b.bus_number, b.bus_name,
                     t.id AS trip_id, t.status AS trip_status, t.started_at, t.ended_at, t.route_id,
-                    t.last_lat, t.last_lng, t.last_speed_kmh, t.last_heading, t.last_accuracy_m, t.last_battery,
+                    t.last_lat, t.last_lng, t.last_speed_kmh, t.avg_speed_kmh, t.last_heading, t.last_accuracy_m, t.last_battery,
                     t.last_fix_at, t.last_ping_at, t.distance_km,
                     d.full_name AS driver_name, d.phone AS driver_phone,
                     r.route_code, r.from_city, r.to_city
@@ -603,14 +618,38 @@ final class LiveFleet
         $cams   = $withCameras ? self::camerasByBus(true) : [];
         $counts = ['live' => 0, 'weak' => 0, 'offline' => 0, 'waiting' => 0, 'parked' => 0, 'idle' => 0];
         $buses  = [];
+        $need   = [];
+        // Load every cache square the on-road buses need in one query.
+        $sq = [];
+        foreach ($rows as $r) {
+            if ($r['last_lat'] !== null && $r['trip_status'] === 'running') {
+                $sq[] = self::cellOf((float) $r['last_lat'], (float) $r['last_lng']);
+                if ($r['last_heading'] !== null) {
+                    [$aLat, $aLng] = self::pointAhead((float) $r['last_lat'], (float) $r['last_lng'], (float) $r['last_heading'], 15.0);
+                    $sq[] = self::cellOf($aLat, $aLng);
+                }
+            }
+        }
+        if ($sq !== []) {
+            self::cells($sq);
+        }
         foreach ($rows as $r) {
             $ping   = $r['last_ping_at'] !== null ? (int) strtotime((string) $r['last_ping_at']) : null;
             $age    = $ping !== null ? max(0, $nowTs - $ping) : null;
             $status = self::statusOf($r['trip_status'] !== null ? (string) $r['trip_status'] : null, $age);
             $counts[$status]++;
             $hasPos = $r['last_lat'] !== null;
-            $stop   = $hasPos && $r['route_id'] !== null && $status !== 'parked'
-                ? self::stopInfo((int) $r['route_id'], (float) $r['last_lat'], (float) $r['last_lng']) : null;
+            $kmh    = $r['last_speed_kmh'] !== null ? (float) $r['last_speed_kmh'] : null;
+            $avg    = $r['avg_speed_kmh'] !== null ? (float) $r['avg_speed_kmh'] : null;
+            $onRoad = $hasPos && $status !== 'parked';
+            $stop   = $onRoad && $r['route_id'] !== null
+                ? self::stopInfo((int) $r['route_id'], (float) $r['last_lat'], (float) $r['last_lng'], $avg ?? $kmh) : null;
+            $near   = $onRoad
+                ? self::placesNear((float) $r['last_lat'], (float) $r['last_lng'], $r['last_heading'] !== null ? (int) $r['last_heading'] : null, $kmh, $avg, $nowTs)
+                : null;
+            foreach ($near['need'] ?? [] as $c) {
+                $need[$c] = true;
+            }
             $buses[] = [
                 'id'      => (int) $r['bus_id'],
                 'number'  => (string) $r['bus_number'],
@@ -627,13 +666,18 @@ final class LiveFleet
                 'route'   => $r['route_code'] !== null ? ['code' => (string) $r['route_code'], 'label' => $r['from_city'] . ' → ' . $r['to_city']] : null,
                 'pos'     => $hasPos ? [
                     'lat' => (float) $r['last_lat'], 'lng' => (float) $r['last_lng'],
-                    'kmh' => $r['last_speed_kmh'] !== null ? (float) $r['last_speed_kmh'] : null,
+                    'kmh' => $kmh,
+                    'avg' => $avg,
                     'hdg' => $r['last_heading'] !== null ? (int) $r['last_heading'] : null,
                     'acc' => $r['last_accuracy_m'] !== null ? (float) $r['last_accuracy_m'] : null,
                     'fix' => $r['last_fix_at'] !== null ? (int) strtotime((string) $r['last_fix_at']) * 1000 : null,
                 ] : null,
                 'battery' => $r['last_battery'] !== null && $status !== 'parked' ? (int) $r['last_battery'] : null,
                 'stop'    => $stop,
+                'place'   => $near['place'] ?? null,
+                'ahead'   => $near['ahead'] ?? null,
+                'towns'   => $near['ahead_list'] ?? [],
+                'temples' => $near['temples'] ?? [],
                 'cameras' => $cams[(int) $r['bus_id']] ?? [],
             ];
         }
@@ -641,7 +685,7 @@ final class LiveFleet
         $rank = ['live' => 0, 'weak' => 1, 'waiting' => 2, 'offline' => 3, 'parked' => 4, 'idle' => 5];
         usort($buses, static fn(array $a, array $b): int => [$rank[$a['status']], $a['id']] <=> [$rank[$b['status']], $b['id']]);
 
-        return ['now' => $nowTs * 1000, 'buses' => $buses, 'counts' => $counts];
+        return ['now' => $nowTs * 1000, 'buses' => $buses, 'counts' => $counts, 'need_cells' => array_slice(array_keys($need), 0, 6)];
     }
 
     /**
@@ -658,31 +702,42 @@ final class LiveFleet
         return array_reverse(array_map(static fn(array $r): array => [(float) $r['lng'], (float) $r['lat']], $rows));
     }
 
-    /** @var array<int, list<array{name:string,lat:float,lng:float}>> */
+    /** @var array<int, list<array{name:string,ne:string,lat:float,lng:float}>> */
     private static array $stopCache = [];
 
     /**
-     * Nearest stop of the route and the one the bus is heading to.
+     * Where the bus is on its route, in road km and minutes.
      *
      * The route's stops (boarding then drop, in timetable order) form a
      * line. The bus is "at" a stop within 1 km of it; otherwise it is
      * between the nearest stop and a neighbour, and the next stop is the
-     * one ahead — decided by which neighbour is closer to the bus than to
-     * the nearest stop.
+     * one ahead — decided by which neighbour is closer to the bus than the
+     * leg is long. Every stop still ahead gets road km (straight line ×
+     * ROAD_FACTOR, as EtaAlerts does) and minutes at the bus's average
+     * moving speed, so the screens can say "Vadodara: 62 km, ~1 h 10 min".
      *
-     * @return array{near:string, near_km:float, at:bool, next:string, next_km:?float}|null
+     * @return array{near:string, near_ne:string, near_km:float, at:bool, next:string, next_ne:string,
+     *               next_km:?float, next_min:?int, upcoming:list<array{name:string,ne:string,km:float,min:int}>}|null
      */
-    public static function stopInfo(int $routeId, float $lat, float $lng): ?array
+    public static function stopInfo(int $routeId, float $lat, float $lng, ?float $kmh = null): ?array
     {
         if (!isset(self::$stopCache[$routeId])) {
-            self::$stopCache[$routeId] = array_map(static fn(array $s): array => [
-                'name' => (string) $s['stop_name'], 'lat' => (float) $s['latitude'], 'lng' => (float) $s['longitude'],
-            ], Database::fetchAll(
+            $stops = [];
+            foreach (Database::fetchAll(
                 "SELECT stop_name, latitude, longitude FROM route_stops
                   WHERE route_id = :r AND latitude IS NOT NULL AND longitude IS NOT NULL
                   ORDER BY stop_type = 'drop', sort_order, id",
                 ['r' => $routeId]
-            ));
+            ) as $s) {
+                $st = ['name' => (string) $s['stop_name'], 'lat' => (float) $s['latitude'], 'lng' => (float) $s['longitude']];
+                $prev = end($stops);
+                // The same place listed twice in a row (boarding + drop at one office) is one stop on the road.
+                if ($prev !== false && self::haversineKm($prev['lat'], $prev['lng'], $st['lat'], $st['lng']) < 0.3) {
+                    continue;
+                }
+                $stops[] = $st + ['ne' => self::nepaliName($st['name'])];
+            }
+            self::$stopCache[$routeId] = $stops;
         }
         $stops = self::$stopCache[$routeId];
         if ($stops === []) {
@@ -698,23 +753,335 @@ final class LiveFleet
             }
         }
         $at = $bestKm <= 1.0;
-        $nextIdx = null;
         if ($at) {
             $nextIdx = $best + 1;
         } elseif (isset($stops[$best + 1])) {
             $n = $stops[$best + 1];
-            // Past the nearest stop when the following one is closer to the bus than the leg is long.
             $nextIdx = self::haversineKm($lat, $lng, $n['lat'], $n['lng']) < self::haversineKm($stops[$best]['lat'], $stops[$best]['lng'], $n['lat'], $n['lng'])
                 ? $best + 1 : $best;
         } else {
             $nextIdx = $best;
         }
-        $next = $stops[$nextIdx] ?? null;
+
+        $upcoming = [];
+        $km = 0.0;
+        $from = ['lat' => $lat, 'lng' => $lng];
+        for ($i = $nextIdx; $i < count($stops); $i++) {
+            $km += self::haversineKm($from['lat'], $from['lng'], $stops[$i]['lat'], $stops[$i]['lng']) * self::ROAD_FACTOR;
+            $upcoming[] = ['name' => $stops[$i]['name'], 'ne' => $stops[$i]['ne'], 'km' => round($km, 1), 'min' => self::etaMinutes($km, $kmh)];
+            $from = $stops[$i];
+        }
+        $next = $upcoming[0] ?? null;
 
         return [
-            'near' => $stops[$best]['name'], 'near_km' => round($bestKm, 1), 'at' => $at,
-            'next' => $next['name'] ?? '', 'next_km' => $next !== null ? round(self::haversineKm($lat, $lng, $next['lat'], $next['lng']), 1) : null,
+            'near' => $stops[$best]['name'], 'near_ne' => $stops[$best]['ne'], 'near_km' => round($bestKm, 1), 'at' => $at,
+            'next' => $next['name'] ?? '', 'next_ne' => $next['ne'] ?? '',
+            'next_km' => $next['km'] ?? null, 'next_min' => $next['min'] ?? null,
+            'upcoming' => array_slice($upcoming, 0, 8),
         ];
+    }
+
+    /** Minutes to cover $km — the same rule as the "bus is near" alerts: unknown or crawling speed = 40 km/h, band 25–70. */
+    public static function etaMinutes(float $km, ?float $kmh): int
+    {
+        $v = ($kmh !== null && $kmh >= 15) ? $kmh : 40.0;
+        $v = max(25.0, min(70.0, $v));
+        return (int) ceil($km / $v * 60);
+    }
+
+    /* =================================================================
+     *  Place names in Nepali (Devanagari)
+     * ================================================================= */
+
+    /** Towns on and around the company's roads (Gujarat → Rajasthan / MP → UP → Nepal border). */
+    private const NE_NAMES = [
+        'surat' => 'सुरत', 'kamrej' => 'कामरेज', 'kosamba' => 'कोसम्बा', 'ankleshwar' => 'अङ्कलेश्वर', 'bharuch' => 'भरुच',
+        'karjan' => 'करजण', 'vadodara' => 'वडोदरा', 'baroda' => 'वडोदरा', 'barauda' => 'वडोदरा', 'anand' => 'आनन्द', 'nadiad' => 'नडियाद',
+        'ahmedabad' => 'अहमदाबाद', 'amd' => 'अहमदाबाद', 'paldi' => 'पालडी', 'chiloda' => 'चिलोडा', 'gandhinagar' => 'गान्धीनगर',
+        'kalol' => 'कलोल', 'mehsana' => 'मेहसाणा', 'unjha' => 'ऊँझा', 'visnagar' => 'विसनगर', 'palanpur' => 'पालनपुर',
+        'himatnagar' => 'हिम्मतनगर', 'godhra' => 'गोधरा', 'dahod' => 'दाहोद', 'halol' => 'हालोल', 'vapi' => 'वापी', 'valsad' => 'वलसाड',
+        'navsari' => 'नवसारी', 'udaipur' => 'उदयपुर', 'chittorgarh' => 'चित्तौडगढ', 'kota' => 'कोटा', 'ajmer' => 'अजमेर', 'jaipur' => 'जयपुर',
+        'ratlam' => 'रतलाम', 'ujjain' => 'उज्जैन', 'indore' => 'इन्दौर', 'dewas' => 'देवास', 'bhopal' => 'भोपाल', 'guna' => 'गुना',
+        'shivpuri' => 'शिवपुरी', 'gwalior' => 'ग्वालियर', 'jhansi' => 'झाँसी', 'agra' => 'आगरा', 'etawah' => 'इटावा', 'kanpur' => 'कानपुर',
+        'lucknow' => 'लखनऊ', 'barabanki' => 'बाराबंकी', 'ayodhya' => 'अयोध्या', 'faizabad' => 'फैजाबाद', 'basti' => 'बस्ती',
+        'gorakhpur' => 'गोरखपुर', 'gonda' => 'गोण्डा', 'bahraich' => 'बहराइच', 'nanpara' => 'नानपारा', 'rupaidiha' => 'रुपैडिहा',
+        'jamunaha' => 'जमुनाहा', 'nepalgunj' => 'नेपालगन्ज', 'nepalganj' => 'नेपालगन्ज', 'kohalpur' => 'कोहलपुर', 'sunauli' => 'सुनौली',
+        'bhairahawa' => 'भैरहवा', 'butwal' => 'बुटवल', 'kathmandu' => 'काठमाडौं', 'pokhara' => 'पोखरा', 'dhangadhi' => 'धनगढी',
+        'mahendranagar' => 'महेन्द्रनगर', 'banbasa' => 'बनबसा', 'bareilly' => 'बरेली', 'sitapur' => 'सीतापुर', 'hardoi' => 'हरदोई',
+        'shahjahanpur' => 'शाहजहाँपुर', 'mathura' => 'मथुरा', 'vrindavan' => 'वृन्दावन', 'delhi' => 'दिल्ली', 'emli' => 'इमली',
+    ];
+
+    /** Devanagari for a place name we know, else ''. "S Hari Parking, Nana Chiloda (Amd)" → चिलोडा. */
+    public static function nepaliName(string $name): string
+    {
+        if (preg_match('/\p{Devanagari}/u', $name) === 1) {
+            return trim($name);
+        }
+        foreach (preg_split('/[^a-z]+/', strtolower($name)) ?: [] as $word) {
+            if (isset(self::NE_NAMES[$word])) {
+                return self::NE_NAMES[$word];
+            }
+        }
+        return '';
+    }
+
+    /* =================================================================
+     *  Towns, villages and Hindu temples along the road (OpenStreetMap)
+     * ================================================================= */
+
+    /** "lat-square:lng-square" of the 0.2° cache square a point is in. */
+    public static function cellOf(float $lat, float $lng): string
+    {
+        return (int) floor($lat / self::CELL_DEG) . ':' . (int) floor($lng / self::CELL_DEG);
+    }
+
+    /** @return array{0:float,1:float,2:float,3:float} south, west, north, east — padded so a square sees a little past its edge */
+    public static function cellBox(string $cell): array
+    {
+        [$a, $b] = array_map('intval', explode(':', $cell) + [1 => 0]);
+        return [round($a * self::CELL_DEG - self::CELL_PAD, 4), round($b * self::CELL_DEG - self::CELL_PAD, 4),
+                round(($a + 1) * self::CELL_DEG + self::CELL_PAD, 4), round(($b + 1) * self::CELL_DEG + self::CELL_PAD, 4)];
+    }
+
+    /** @var array<string, array{status:string, at:int, items:list<array>}|null> */
+    private static array $cellCache = [];
+
+    /**
+     * Cached squares, one query for all the ones not read yet this request.
+     *
+     * @param list<string> $cells
+     * @return array<string, array{status:string, at:int, items:list<array>}|null>
+     */
+    public static function cells(array $cells): array
+    {
+        $want = array_values(array_unique(array_filter($cells, static fn(string $c): bool => !array_key_exists($c, self::$cellCache))));
+        if ($want !== []) {
+            foreach ($want as $c) {
+                self::$cellCache[$c] = null;
+            }
+            $ph = implode(',', array_fill(0, count($want), '?'));
+            foreach (Database::fetchAll("SELECT cell, status, fetched_at, data FROM fleet_places WHERE cell IN ($ph)", $want) as $r) {
+                $items = $r['status'] === 'ok' ? json_decode((string) $r['data'], true) : [];
+                self::$cellCache[(string) $r['cell']] = ['status' => (string) $r['status'], 'at' => (int) strtotime((string) $r['fetched_at']),
+                    'items' => is_array($items) ? $items : []];
+            }
+        }
+        return array_intersect_key(self::$cellCache, array_flip($cells));
+    }
+
+    /** Does this square still need fetching (never fetched, failed a while ago, or very old)? */
+    private static function cellNeeded(?array $c, int $nowTs): bool
+    {
+        if ($c === null) {
+            return true;
+        }
+        return match ($c['status']) {
+            'ok'      => $c['at'] < $nowTs - self::CELL_KEEP_DAYS * 86400,
+            'pending' => $c['at'] < $nowTs - 120,
+            default   => $c['at'] < $nowTs - self::CELL_RETRY_SECONDS,
+        };
+    }
+
+    /** @param list<array{0:string,1:float,2:float,3:string,4:string,5:string}> $items */
+    public static function storeCell(string $cell, array $items, string $status = 'ok'): void
+    {
+        Database::query(
+            'INSERT INTO fleet_places (cell, status, fetched_at, n_items, data) VALUES (:c, :s, :f, :n, :d)
+             ON DUPLICATE KEY UPDATE status = VALUES(status), fetched_at = VALUES(fetched_at), n_items = VALUES(n_items), data = VALUES(data)',
+            ['c' => $cell, 's' => $status, 'f' => date('Y-m-d H:i:s'), 'n' => count($items),
+             'd' => json_encode($items, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)]
+        );
+        unset(self::$cellCache[$cell]);
+    }
+
+    /**
+     * Overpass JSON → compact items [kind, lat, lng, devanagari, english, osm id].
+     * kind: city | town | village | suburb | temple. Hindu temples and
+     * settlements only; anything without a usable name is skipped.
+     *
+     * @param array<string,mixed> $json
+     * @return list<array{0:string,1:float,2:float,3:string,4:string,5:string}>
+     */
+    public static function parseOverpass(array $json): array
+    {
+        $out = [];
+        foreach ((array) ($json['elements'] ?? []) as $e) {
+            if (!is_array($e) || !is_array($e['tags'] ?? null)) {
+                continue;
+            }
+            $t   = $e['tags'];
+            $lat = $e['lat'] ?? ($e['center']['lat'] ?? null);
+            $lng = $e['lon'] ?? ($e['center']['lon'] ?? null);
+            if (!is_numeric($lat) || !is_numeric($lng)) {
+                continue;
+            }
+            if (($t['amenity'] ?? '') === 'place_of_worship' && ($t['religion'] ?? '') === 'hindu') {
+                $kind = 'temple';
+            } elseif (in_array($t['place'] ?? '', ['city', 'town', 'village', 'suburb'], true)) {
+                $kind = (string) $t['place'];
+            } else {
+                continue;
+            }
+            $name = trim((string) ($t['name'] ?? ''));
+            $isDeva = preg_match('/\p{Devanagari}/u', $name) === 1;
+            $en = trim((string) ($t['name:en'] ?? ($isDeva ? '' : $name)));
+            $ne = trim((string) ($t['name:ne'] ?? $t['name:hi'] ?? ($isDeva ? $name : '')));
+            if ($ne === '' && $en !== '' && $kind !== 'temple') {
+                $ne = self::nepaliName($en);
+            }
+            if ($ne === '' && $en === '') {
+                continue;
+            }
+            $out[] = [$kind, round((float) $lat, 6), round((float) $lng, 6), mb_substr($ne, 0, 80), mb_substr($en, 0, 80),
+                substr((string) ($e['type'] ?? 'n'), 0, 1) . (int) ($e['id'] ?? 0)];
+        }
+        return $out;
+    }
+
+    /**
+     * Fetch one square from Overpass and cache it. Never throws: a failure is
+     * stored as 'error' and retried after CELL_RETRY_SECONDS.
+     *
+     * @param callable(string $url, string $query):?string|null $http injected by tests
+     */
+    public static function fetchCell(string $cell, ?callable $http = null): string
+    {
+        if (preg_match('/^-?\d{1,4}:-?\d{1,4}$/', $cell) !== 1) {
+            return 'bad';
+        }
+        // Claim it, so ten screens asking at once make one request.
+        $claimed = Database::query(
+            "INSERT INTO fleet_places (cell, status, fetched_at, n_items) VALUES (:c, 'pending', :f, 0)
+             ON DUPLICATE KEY UPDATE status = IF(status = 'pending' AND fetched_at > :busy, status, 'pending'),
+                                     fetched_at = IF(status = 'pending' AND fetched_at > :busy2, fetched_at, VALUES(fetched_at))",
+            ['c' => $cell, 'f' => date('Y-m-d H:i:s'), 'busy' => date('Y-m-d H:i:s', time() - 120), 'busy2' => date('Y-m-d H:i:s', time() - 120)]
+        )->rowCount();
+        unset(self::$cellCache[$cell]);
+        if ($claimed === 0) {
+            return 'pending';      // another request is fetching it right now
+        }
+        [$s, $w, $n, $e] = self::cellBox($cell);
+        $bbox  = "$s,$w,$n,$e";
+        $query = "[out:json][timeout:25];(node[\"place\"~\"^(city|town|village|suburb)$\"][\"name\"]($bbox);"
+               . "nwr[\"amenity\"=\"place_of_worship\"][\"religion\"=\"hindu\"][\"name\"]($bbox););out center tags qt;";
+        $url   = Settings::getString('fleet_overpass_url', 'https://overpass-api.de/api/interpreter');
+        $http ??= static function (string $url, string $query): ?string {
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => http_build_query(['data' => $query]),
+                CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 40, CURLOPT_CONNECTTIMEOUT => 10,
+                CURLOPT_USERAGENT => 'ShreeHariGlobal-LiveFleet/1.0 (+' . rtrim(APP_URL, '/') . ')']);
+            $body = curl_exec($ch);
+            $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            curl_close($ch);
+            return is_string($body) && $code === 200 ? $body : null;
+        };
+        try {
+            $body = $http($url, $query);
+            $json = is_string($body) ? json_decode($body, true) : null;
+            if (!is_array($json) || !isset($json['elements'])) {
+                throw new RuntimeException('no Overpass answer');
+            }
+            self::storeCell($cell, self::parseOverpass($json));
+            return 'ok';
+        } catch (Throwable $ex) {
+            self::storeCell($cell, [], 'error');
+            Logger::warning('fleet places fetch failed', ['cell' => $cell, 'err' => $ex->getMessage()]);
+            return 'error';
+        }
+    }
+
+    /** Point $km along compass heading $hdg from (lat, lng). @return array{0:float,1:float} */
+    public static function pointAhead(float $lat, float $lng, float $hdg, float $km): array
+    {
+        $d = $km / 6371.0;
+        $b = deg2rad($hdg);
+        $p1 = deg2rad($lat);
+        $p2 = asin(sin($p1) * cos($d) + cos($p1) * sin($d) * cos($b));
+        $l2 = deg2rad($lng) + atan2(sin($b) * sin($d) * cos($p1), cos($d) - sin($p1) * sin($p2));
+        return [rad2deg($p2), rad2deg($l2)];
+    }
+
+    public static function bearing(float $lat1, float $lng1, float $lat2, float $lng2): float
+    {
+        $y = sin(deg2rad($lng2 - $lng1)) * cos(deg2rad($lat2));
+        $x = cos(deg2rad($lat1)) * sin(deg2rad($lat2)) - sin(deg2rad($lat1)) * cos(deg2rad($lat2)) * cos(deg2rad($lng2 - $lng1));
+        return fmod(rad2deg(atan2($y, $x)) + 360.0, 360.0);
+    }
+
+    /** How far each kind of settlement reaches — inside it, the bus is "in" that place. */
+    private const PLACE_RADIUS_KM = ['city' => 7.0, 'town' => 3.5, 'suburb' => 2.0, 'village' => 1.5];
+
+    /**
+     * The place the bus is in (or nearest to), the towns ahead with road km
+     * and minutes, and Hindu temples within 3 km — from the cached squares.
+     * `need` lists squares not cached yet (the screens ask api/fleet-places.php
+     * to fetch them, so the 1-second refresh itself never waits on the internet).
+     *
+     * @return array{place:?array, ahead:?array, ahead_list:list<array>, temples:list<array>, need:list<string>}
+     */
+    public static function placesNear(float $lat, float $lng, ?int $hdg, ?float $kmh, ?float $avgKmh = null, ?int $nowTs = null): array
+    {
+        $nowTs = $nowTs ?? time();
+        $want  = [self::cellOf($lat, $lng)];
+        if ($hdg !== null) {
+            [$aLat, $aLng] = self::pointAhead($lat, $lng, (float) $hdg, 15.0);
+            $want[] = self::cellOf($aLat, $aLng);
+        }
+        $want  = array_values(array_unique($want));
+        $cells = self::cells($want);
+        $need  = array_values(array_filter($want, fn(string $c): bool => self::cellNeeded($cells[$c] ?? null, $nowTs)));
+
+        $items = [];
+        foreach ($cells as $c) {
+            foreach ($c['items'] ?? [] as $it) {
+                $items[(string) ($it[5] ?? '') . '|' . $it[1] . '|' . $it[2]] = $it;
+            }
+        }
+        $place = null;
+        $placeScore = INF;
+        $nearest = null;
+        $aheadAll = [];
+        $temples = [];
+        foreach ($items as $it) {
+            [$kind, $pLat, $pLng, $ne, $en] = $it;
+            $km = self::haversineKm($lat, $lng, (float) $pLat, (float) $pLng);
+            if ($kind === 'temple') {
+                if ($km <= 3.0) {
+                    $isAhead = $hdg !== null && $km > 0.15 && abs(self::angleDiff(self::bearing($lat, $lng, (float) $pLat, (float) $pLng), (float) $hdg)) <= 60;
+                    $temples[] = ['id' => (string) ($it[5] ?? ''), 'name' => $ne !== '' ? $ne : $en, 'en' => $en, 'km' => round($km, 2), 'ahead' => $isAhead,
+                        'lat' => (float) $pLat, 'lng' => (float) $pLng];
+                }
+                continue;
+            }
+            $label = ['name' => $ne !== '' ? $ne : $en, 'en' => $en, 'kind' => $kind, 'km' => round($km, 1)];
+            $r = self::PLACE_RADIUS_KM[$kind] ?? 1.5;
+            if ($km <= $r && $km / $r < $placeScore) {
+                $place = $label + ['at' => true];
+                $placeScore = $km / $r;
+            }
+            if ($km <= 10 && ($nearest === null || $km < $nearest['km'])) {
+                $nearest = $label + ['at' => false];
+            }
+            // Towns and cities in front of the bus (within 35° of its heading).
+            if ($hdg !== null && in_array($kind, ['city', 'town'], true) && $km >= 1.0 && $km <= 40.0
+                && abs(self::angleDiff(self::bearing($lat, $lng, (float) $pLat, (float) $pLng), (float) $hdg)) <= 35) {
+                $road = $km * self::ROAD_FACTOR;
+                $aheadAll[] = array_merge($label, ['air' => $km, 'km' => round($road, 1), 'min' => self::etaMinutes($road, $avgKmh ?? $kmh)]);
+            }
+        }
+        $place = $place ?? $nearest;
+        // The town the bus is already in is not "ahead" of it.
+        $aheadAll = array_values(array_filter($aheadAll, static fn(array $a): bool => $place === null || !$place['at'] || $a['name'] !== $place['name']));
+        usort($aheadAll, static fn(array $a, array $b): int => $a['air'] <=> $b['air']);
+        $aheadAll = array_map(static function (array $a): array { unset($a['air']); return $a; }, array_slice($aheadAll, 0, 4));
+        usort($temples, static fn(array $a, array $b): int => $a['km'] <=> $b['km']);
+
+        return ['place' => $place, 'ahead' => $aheadAll[0] ?? null, 'ahead_list' => $aheadAll, 'temples' => array_slice($temples, 0, 5), 'need' => $need];
+    }
+
+    private static function angleDiff(float $a, float $b): float
+    {
+        return fmod($a - $b + 540.0, 360.0) - 180.0;
     }
 
     public static function haversineKm(float $lat1, float $lng1, float $lat2, float $lng2): float

@@ -51,7 +51,7 @@ admin_header('Live Fleet', 'live-fleet');
 .lfa-wrap{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:14px;align-items:start}
 #lfaMap{height:calc(100vh - 190px);min-height:440px;border-radius:14px;border:1px solid var(--line)}
 .lfa-side{display:flex;flex-direction:column;gap:12px;max-height:calc(100vh - 190px);overflow:auto}
-.lfa-card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.lfa-card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;flex:0 0 auto}
 .lfa-card h3{margin:0;padding:11px 14px;font-size:14px;border-bottom:1px solid var(--line);background:var(--head);display:flex;align-items:center;gap:8px}
 .lfa-card h3 small{margin-left:auto;font-weight:500;color:var(--mut);font-size:11.5px}
 .lfa-det{padding:14px;display:flex;flex-direction:column;gap:10px;font-size:13.5px}
@@ -102,6 +102,9 @@ admin_header('Live Fleet', 'live-fleet');
     <div class="lfa-card"><h3>🚌 Selected bus <small id="dAge"></small></h3>
       <div id="lfaDet" class="lfa-empty">Tap a bus on the map or in the list. · नक्सा वा सूचीमा बस छान्नुहोस्।</div>
     </div>
+    <div class="lfa-card"><h3>📢 घोषणा · Announcements <small><button class="btn ghost sm" type="button" id="bVoice">🔇 आवाज बन्द</button></small></h3>
+      <ul class="lf-log" id="lfaLog"><li class="muted">Arrivals, next stop km / time and temples on the way appear here (Nepali). Press the button to hear them.</li></ul>
+    </div>
     <div class="lfa-card"><h3>📹 Cameras · क्यामेरा <small id="camNote"></small></h3>
       <div class="lfa-cams"><div class="lf-cams" id="lfaCams"></div></div>
     </div>
@@ -140,6 +143,50 @@ admin_header('Live Fleet', 'live-fleet');
     poller.now();
   }
 
+  /* The stops still ahead: km on the road and time at the bus's average speed. */
+  function upcomingHtml(b) {
+    var st = b.stop;
+    if (!st || !st.upcoming || !st.upcoming.length) return '';
+    var now = Date.now();
+    return '<div><b>🚏 आउने स्टपहरू</b>' + (st.at ? ' <span class="muted">· अहिले ' + esc(LF.nm(st.near_ne, st.near)) + 'मा</span>' : '')
+      + '<table class="lf-up"><tbody>' + st.upcoming.slice(0, 6).map(function (u, i) {
+        return '<tr' + (i === 0 ? ' class="next"' : '') + '><td><b>' + esc(LF.nm(u.ne, u.name)) + '</b>' + (u.ne ? '<small>' + esc(u.name) + '</small>' : '') + '</td>'
+          + '<td>' + LF.neKm(u.km) + '</td><td>' + LF.neDur(u.min) + '<br><small>' + LF.neClock(now + u.min * 60000) + '</small></td></tr>';
+      }).join('') + '</tbody></table></div>';
+  }
+  function townsHtml(b) {
+    if (!b.towns || !b.towns.length) return '';
+    var now = Date.now();
+    return '<div><b>➡️ आउने ठाउँहरू</b><table class="lf-up"><tbody>' + b.towns.map(function (t, i) {
+      return '<tr' + (i === 0 ? ' class="next"' : '') + '><td><b>' + esc(t.name) + '</b>' + (t.en && t.en !== t.name ? '<small>' + esc(t.en) + '</small>' : '') + '</td>'
+        + '<td>' + LF.neKm(t.km) + '</td><td>' + LF.neDur(t.min) + '<br><small>' + LF.neClock(now + t.min * 60000) + '</small></td></tr>';
+    }).join('') + '</tbody></table></div>';
+  }
+  function templesHtml(b) {
+    if (!b.temples || !b.temples.length) return '';
+    return '<div><b>🛕 नजिकैका मन्दिर</b>' + b.temples.map(function (t) {
+      return '<div>' + esc(t.name) + (t.en && t.en !== t.name ? ' <span class="muted">' + esc(t.en) + '</span>' : '') + ' · ' + LF.neKm(t.km) + (t.ahead ? ' ⬆️' : '') + '</div>';
+    }).join('') + '</div>';
+  }
+
+  /* 📢 Nepali announcements for every bus on the road; spoken after 🔊. */
+  var tracker = new LF.Tracker();
+  var logEl = document.getElementById('lfaLog');
+  var voice = new LF.Announcer(function (text, icon) {
+    if (logEl.querySelector('.muted')) logEl.innerHTML = '';
+    var li = document.createElement('li');
+    li.innerHTML = '<span>' + esc(icon || '📢') + '</span><span>' + esc(text) + '</span><time>' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + '</time>';
+    logEl.insertBefore(li, logEl.firstChild);
+    while (logEl.children.length > 40) logEl.removeChild(logEl.lastChild);
+  });
+  var bVoice = document.getElementById('bVoice');
+  if (!voice.supported()) { bVoice.disabled = true; bVoice.title = 'This browser cannot speak'; }
+  bVoice.onclick = function () {
+    var on = voice.enable(!voice.on);
+    bVoice.classList.toggle('on', on);
+    bVoice.textContent = on ? '🔊 आवाज खुला' : '🔇 आवाज बन्द';
+  };
+
   function render() {
     var b = state.sel != null ? bus(state.sel) : null;
     var det = document.getElementById('lfaDet');
@@ -161,8 +208,11 @@ admin_header('Live Fleet', 'live-fleet');
         + '<div class="lfa-stat"><div class="k">Driven</div><div class="v">' + (b.trip ? b.trip.km : '—') + ' <small>km</small></div></div>'
         + '<div class="lfa-stat"><div class="k">' + (b.status === 'parked' ? 'Ended' : 'Started') + '</div><div class="v" style="font-size:15px">' + (b.trip ? new Date(b.status === 'parked' && b.trip.ended ? b.trip.ended : b.trip.started).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '—') + '</div></div>'
         + '</div>'
-        + (b.stop ? '<div>' + (b.stop.at ? '📍 At <b>' + esc(b.stop.near) + '</b>' : '📍 Near <b>' + esc(b.stop.near) + '</b> (' + b.stop.near_km + ' km)')
-            + (b.stop.next ? '<br>➡️ Next: <b>' + esc(b.stop.next) + '</b>' + (b.stop.next_km != null ? ' · ' + b.stop.next_km + ' km' + (moving && p.kmh > 5 ? ' · ~' + Math.max(1, Math.round(b.stop.next_km / Math.max(p.kmh, 25) * 60)) + ' min' : '') : '') : '') + '</div>' : '')
+        + (b.place ? '<div>📍 अहिले: <b>' + esc(b.place.name) + '</b>' + (b.place.en && b.place.en !== b.place.name ? ' <span class="muted">' + esc(b.place.en) + '</span>' : '')
+            + (b.place.at ? '' : ' <span class="muted">(' + LF.neKm(b.place.km) + ')</span>') + '</div>' : '')
+        + townsHtml(b)
+        + upcomingHtml(b)
+        + templesHtml(b)
         + (b.driver ? '<div class="lfa-row">👤 <b>' + esc(b.driver.name) + '</b>' + (started ? '<span class="muted">since ' + esc(started.toLocaleString([], { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })) + '</span>' : '') + '</div>' : '')
         + '<div class="lfa-acts">'
         + (tel ? '<a class="btn ghost" href="tel:+' + esc(tel) + '">📞 Call driver</a><a class="btn ghost" target="_blank" rel="noopener" href="https://wa.me/' + esc(tel) + '">💬 WhatsApp</a>' : '')
@@ -178,7 +228,9 @@ admin_header('Live Fleet', 'live-fleet');
     if (!state.buses.length) { list.innerHTML = '<div class="lfa-empty">No active buses in the fleet.</div>'; return; }
     list.innerHTML = state.buses.map(function (x) {
       var s = LF.STATUS[x.status] || LF.STATUS.idle, moving = x.status === 'live' || x.status === 'weak';
-      var where = x.stop ? (x.stop.at ? 'At ' + x.stop.near : 'Near ' + x.stop.near) + (x.stop.next ? ' → ' + x.stop.next : '') : (x.route ? x.route.label : '');
+      var where = x.status === 'parked' ? '' : (x.place ? '📍 ' + x.place.name : '')
+        + (x.stop && x.stop.next ? ' → ' + LF.nm(x.stop.next_ne, x.stop.next) + ' ' + LF.neKm(x.stop.next_km) : '');
+      if (!where && x.route) where = x.route.label;
       return '<div class="lfa-item' + (x.id === state.sel ? ' sel' : '') + '" data-id="' + x.id + '">'
         + '<span class="ic">🚌<i style="background:' + s.c + '"></i></span>'
         + '<span class="tx"><b>' + esc(x.name) + ' · ' + esc(x.number) + '</b><span>' + esc(s.en) + (x.driver ? ' · ' + esc(x.driver.name) : '') + (where ? ' · ' + esc(where) : '') + '</span></span>'
@@ -230,11 +282,14 @@ admin_header('Live Fleet', 'live-fleet');
       fm.update(d.buses);
       if (state.sel != null) fm.select(state.sel);
       if (d.trail && state.trail && d.trail.trip === tripOf(state.sel)) fm.setTrail(d.trail.points);
+      fm.setPois(LF.poisFor(bus(state.sel)));
       if (state.first) {
         state.first = false;
         if (state.sel != null && bus(state.sel) && bus(state.sel).pos) fm.focus(state.sel, 12, 0); else fm.fitAll(60, 0);
       }
     }).catch(function () {});
+    tracker.events(d.buses).forEach(function (ev) { voice.say(ev.text, ev.icon); });
+    if (d.need_cells && d.need_cells.length) LF.warmCells(d.need_cells);
     render();
   }, function (e) {
     if (e && e.status === 401) { conn.classList.add('bad'); conn.querySelector('span').textContent = 'signed out — reload the page'; }

@@ -38,3 +38,25 @@
 .lf-cam .lf-cam-rec{position:absolute;right:8px;top:8px;z-index:2;font:800 10.5px/1 system-ui,sans-serif;color:#fff;background:#dc2626;padding:4px 7px;border-radius:6px;letter-spacing:.05em}
 .lf-cam .lf-cam-err{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:12px;color:#cbd5e1;font-size:12.5px;z-index:1}
 .lf-cam-empty{border:2px dashed var(--line,#334155);border-radius:12px;padding:16px;text-align:center;color:var(--mut,#94a3b8);font-size:13px}
+
+/* ── temple / place labels on the map ─────────────────────────────── */
+.lf-poi{display:flex;align-items:center;gap:5px;padding:4px 9px 4px 5px;border-radius:999px;background:var(--lf-poi-bg,#fff);color:var(--lf-poi-fg,#16233c);
+  box-shadow:0 2px 8px rgba(0,0,0,.3);font:600 12px/1.2 'Noto Sans Devanagari',system-ui,sans-serif;white-space:nowrap;pointer-events:none;max-width:240px}
+.lf-poi::after{content:'';position:absolute;left:50%;bottom:-5px;margin-left:-5px;border:5px solid transparent;border-bottom:0;border-top-color:var(--lf-poi-bg,#fff)}
+.lf-poi-i{width:22px;height:22px;border-radius:50%;background:#FFF1E0;display:flex;align-items:center;justify-content:center;font-size:13px;flex:0 0 auto}
+.lf-poi-t{overflow:hidden;text-overflow:ellipsis}
+.lf-poi-t small{margin-left:5px;font-weight:700;color:#D96A10}
+
+/* ── upcoming stops table ─────────────────────────────────────────── */
+.lf-up{width:100%;border-collapse:collapse;font-size:13px}
+.lf-up td{padding:6px 4px;border-top:1px solid var(--line,#e4e9f1);vertical-align:top}
+.lf-up td:nth-child(n+2){text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.lf-up b{display:block}
+.lf-up small{color:var(--mut,#6b7688)}
+.lf-up tr.next td{font-weight:700}
+
+/* ── announcement log ─────────────────────────────────────────────── */
+.lf-log{list-style:none;margin:0;padding:0;max-height:260px;overflow:auto}
+.lf-log li{display:flex;gap:8px;padding:8px 14px;border-top:1px solid var(--line,#e4e9f1);font-size:13.5px;line-height:1.45}
+.lf-log li:first-child{border-top:0;background:color-mix(in srgb,#F07C1F 8%,transparent)}
+.lf-log li time{color:var(--mut,#6b7688);font-size:11.5px;white-space:nowrap;margin-left:auto;padding-left:8px}

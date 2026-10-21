@@ -5,6 +5,7 @@
  *    LiveFleet.poll(url, ms, onData, onError)   1-second refresh loop
  *    new LiveFleet.FleetMap(el, opts)           MapLibre map + one marker per bus
  *    LiveFleet.renderCams(box, cameras)         CCTV tiles (HLS / MJPEG / snapshot / embed)
+ *    new LiveFleet.Tracker() / .Announcer()     Nepali journey announcements, spoken aloud
  *
  *  Markers glide between fixes (a short tween each second) so a moving
  *  bus reads like video instead of a dot that hops.
@@ -301,6 +302,30 @@
     });
   };
 
+  /* Labelled points near the bus: 🛕 temples, 🚏 stops ahead. Drawn as HTML
+     (not map text) so Devanagari names render correctly.
+     pois: [{ key, icon, label, sub, lng, lat }] */
+  FM.setPois = function (pois) {
+    if (!this.map) return;
+    this.poi = this.poi || {};
+    var seen = {}, self = this;
+    (pois || []).forEach(function (p) {
+      seen[p.key] = true;
+      var m = self.poi[p.key];
+      var html = '<span class="lf-poi-i">' + LF.esc(p.icon) + '</span><span class="lf-poi-t">' + LF.esc(p.label)
+        + (p.sub ? '<small>' + LF.esc(p.sub) + '</small>' : '') + '</span>';
+      if (!m) {
+        var el = document.createElement('div');
+        el.className = 'lf-poi';
+        m = self.poi[p.key] = { el: el, html: '', marker: new w.maplibregl.Marker({ element: el, anchor: 'bottom' }).setLngLat([p.lng, p.lat]).addTo(self.map) };
+      }
+      if (m.html !== html) { m.el.innerHTML = html; m.html = html; }
+    });
+    for (var k in this.poi) {
+      if (!seen[k]) { this.poi[k].marker.remove(); delete this.poi[k]; }
+    }
+  };
+
   FM.resize = function () { if (this.map) this.map.resize(); };
 
   /* ── CCTV tiles ─────────────────────────────────────────────────── */
@@ -380,5 +405,177 @@
       return;
     }
     cams.forEach(function (c) { box.appendChild(camTile(c)); });
+  };
+
+  /* ── Nepali words, numbers and times ────────────────────────────── */
+  var NE_DIGITS = '०१२३४५६७८९';
+  LF.ne = function (v) { return String(v).replace(/[0-9]/g, function (d) { return NE_DIGITS[+d]; }); };
+  LF.neKm = function (km) { return km == null ? '' : LF.ne(km >= 10 ? Math.round(km) : Math.round(km * 10) / 10) + ' किमी'; };
+  /** 135 → "२ घण्टा १५ मिनेट" (rounded to 5 min past the first hour). */
+  LF.neDur = function (min) {
+    if (min == null) return '';
+    if (min < 60) return LF.ne(Math.max(1, Math.round(min))) + ' मिनेट';
+    var h = Math.floor(min / 60), m = Math.round((min % 60) / 5) * 5;
+    if (m === 60) { h++; m = 0; }
+    return LF.ne(h) + ' घण्टा' + (m ? ' ' + LF.ne(m) + ' मिनेट' : '');
+  };
+  /** ms → "बेलुका ७:३०", "भोलि बिहान ६:१०" — the day is named when it is not today. */
+  LF.neClock = function (ms) {
+    var d = new Date(ms), h = d.getHours(), m = d.getMinutes();
+    var part = h < 4 ? 'राति' : h < 12 ? 'बिहान' : h < 16 ? 'दिउँसो' : h < 19 ? 'बेलुका' : 'राति';
+    var t0 = new Date(); t0.setHours(0, 0, 0, 0);
+    var days = Math.floor((new Date(d).setHours(0, 0, 0, 0) - t0) / 86400000);
+    var day = days === 1 ? 'भोलि ' : days === 2 ? 'पर्सि ' : days > 2 ? LF.ne(d.getDate()) + ' गते ' : '';
+    return day + part + ' ' + LF.ne(h % 12 || 12) + ':' + LF.ne(m < 10 ? '0' + m : m);
+  };
+  LF.neSpeed = function (kmh) { return LF.ne(Math.round(kmh || 0)) + ' किमी/घण्टा'; };
+  /** A stop or place in Devanagari when known, else as written. */
+  LF.nm = function (ne, en) { return ne || en || ''; };
+
+  /* A greeting that fits the temple's deity — said after its name. */
+  var GREET = [
+    [/shiv|mahadev|mahakal|nath\b|somnath|neelkanth|शिव|महादेव|महाकाल|नाथ/i, 'हर हर महादेव'],
+    [/\bram\b|rama|raghu|hanuman|bajrang|maruti|राम|हनुमान|बजरंग/i, 'जय श्री राम'],
+    [/krishna|krishn|govind|gopal|radha|shyam|swaminarayan|iskcon|dwarka|kanha|thakor|कृष्ण|गोविन्द|गोपाल|राधा|श्याम|स्वामिनारायण|स्वामीनारायण|द्वारका|ठाकोर/i, 'जय श्री कृष्ण'],
+    [/durga|ambe|amba|mata|devi|kali|bhavani|chamunda|vaishno|sherawali|bahuchar|दुर्गा|अम्बे|अम्बा|माता|देवी|काली|भवानी|चामुण्डा/i, 'जय माता दी'],
+    [/ganesh|ganpati|vinayak|गणेश|गणपति|विनायक/i, 'गणपति बाप्पा मोरया'],
+    [/jagannath|जगन्नाथ/i, 'जय जगन्नाथ'],
+    [/sai\b|साईं|साई/i, 'ॐ साईं राम'],
+    [/vishnu|narayan|hari\b|balaji|venkatesh|विष्णु|नारायण|हरि|बालाजी/i, 'ॐ नमो नारायणाय']
+  ];
+  LF.greet = function (name, en) {
+    var t = (name || '') + ' ' + (en || '');
+    for (var i = 0; i < GREET.length; i++) if (GREET[i][0].test(t)) return GREET[i][1];
+    return 'जय श्री हरि';
+  };
+
+  /* ── what changed since the last refresh → Nepali sentences ────────
+     One Tracker per page. events(buses) returns [{ busId, icon, text }]:
+       🚏 arrived at a stop / left it, with the next stop's km and time
+       📍 reached a town or village (at most once a minute per bus)
+       🛕 a Hindu temple within 1 km (once per temple per bus)
+       🕒 every 15 min: speed, and km + time to the last stop */
+  LF.Tracker = function () { this.prev = {}; this.placeAt = {}; this.lastPlace = {}; this.temples = {}; this.etaAt = {}; };
+  LF.Tracker.prototype.events = function (buses, nowMs) {
+    var out = [], self = this, now = nowMs || Date.now();
+    buses.forEach(function (b) {
+      var p = self.prev[b.id];
+      var moving = b.status === 'live' || b.status === 'weak';
+      self.prev[b.id] = { status: b.status, stop: b.stop, place: b.place };
+      if (!moving) return;
+      var bus = b.name || b.number, st = b.stop, said = false;
+      var nextTxt = function () {
+        return st && st.next ? ' अर्को स्टप ' + LF.nm(st.next_ne, st.next) + ' — ' + LF.neKm(st.next_km) + ', करिब ' + LF.neDur(st.next_min) + '।' : '';
+      };
+      if (!p) {
+        if (b.place) {
+          out.push({ busId: b.id, icon: '📍', text: bus + ' अहिले ' + b.place.name + (b.place.at ? 'मा' : ' नजिक') + ' छ।' + nextTxt() });
+          self.lastPlace[b.id] = b.place.name; self.placeAt[b.id] = now;
+        }
+        self.etaAt[b.id] = now;
+        return;
+      }
+      if (st && st.at && (!p.stop || !p.stop.at || p.stop.near !== st.near)) {
+        out.push({ busId: b.id, icon: '🚏', text: bus + ' ' + LF.nm(st.near_ne, st.near) + ' आइपुग्यो।' + nextTxt() });
+        said = true;
+      } else if (p.stop && p.stop.at && st && !st.at) {
+        out.push({ busId: b.id, icon: '🚌', text: bus + ' ' + LF.nm(p.stop.near_ne, p.stop.near) + 'बाट हिँड्यो।' + nextTxt() });
+        said = true;
+      }
+      if (b.place && b.place.at && b.place.name !== self.lastPlace[b.id] && now - (self.placeAt[b.id] || 0) >= 60000) {
+        self.lastPlace[b.id] = b.place.name; self.placeAt[b.id] = now;
+        if (!said) {
+          var a = b.ahead;
+          out.push({ busId: b.id, icon: '📍', text: bus + ' ' + b.place.name + ' आइपुग्यो।'
+            + (a ? ' अगाडि ' + a.name + ' — ' + LF.neKm(a.km) + ', करिब ' + LF.neDur(a.min) + '।' : '') });
+          said = true;
+        }
+      }
+      (b.temples || []).some(function (t) {
+        var k = b.id + ':' + t.id;
+        if (t.km > 1.0 || self.temples[k]) return false;
+        self.temples[k] = now;
+        out.push({ busId: b.id, icon: '🛕', text: bus + ' नजिकै ' + t.name + ' — ' + LF.neKm(t.km) + '। ' + LF.greet(t.name, t.en) + '!' });
+        return true;
+      });
+      if (now - (self.etaAt[b.id] || 0) >= 15 * 60000 && st && st.upcoming && st.upcoming.length) {
+        self.etaAt[b.id] = now;
+        var d = st.upcoming[st.upcoming.length - 1];
+        out.push({ busId: b.id, icon: '🕒', text: bus + ': गति ' + LF.neSpeed(b.pos && b.pos.kmh) + '। ' + LF.nm(d.ne, d.name) + ' सम्म '
+          + LF.neKm(d.km) + ', करिब ' + LF.neDur(d.min) + ' — ' + LF.neClock(now + d.min * 60000) + ' सम्म पुग्ने अनुमान।' });
+      }
+    });
+    return out;
+  };
+
+  /* ── speaking (Web Speech API) ────────────────────────────────────
+     Browsers only allow speech after a click, so the page shows a 🔊 button
+     that calls enable(true). Uses a Nepali voice if the device has one,
+     otherwise Hindi (same script, understood by Nepali listeners). */
+  LF.Announcer = function (onText) { this.on = false; this.q = []; this.busy = false; this.onText = onText || null; this.voice = null; };
+  var AN = LF.Announcer.prototype;
+  AN.supported = function () { return 'speechSynthesis' in w && typeof w.SpeechSynthesisUtterance === 'function'; };
+  AN.pickVoice = function () {
+    if (!this.supported()) return null;
+    var v = w.speechSynthesis.getVoices() || [];
+    var by = function (re) { for (var i = 0; i < v.length; i++) if (re.test(v[i].lang)) return v[i]; return null; };
+    return by(/^ne/i) || by(/^hi/i) || by(/^mr/i) || null;
+  };
+  AN.enable = function (on) {
+    this.on = !!on && this.supported();
+    if (!this.supported()) return false;
+    w.speechSynthesis.cancel();
+    this.q = []; this.busy = false;
+    if (this.on) { this.voice = this.pickVoice(); this._speak('घोषणा सुरु भयो। जय श्री हरि।'); }
+    return this.on;
+  };
+  AN.say = function (text, icon) {
+    if (this.onText) this.onText(text, icon);
+    if (!this.on) return;
+    this.q.push(text);
+    if (this.q.length > 4) this.q.splice(0, this.q.length - 4);   // never fall minutes behind the buses
+    this._next();
+  };
+  AN._next = function () {
+    if (this.busy || !this.q.length) return;
+    this._speak(this.q.shift());
+  };
+  AN._speak = function (text) {
+    var self = this;
+    var u = new w.SpeechSynthesisUtterance(String(text).replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '').replace(/—/g, ','));
+    if (!this.voice) this.voice = this.pickVoice();
+    if (this.voice) u.voice = this.voice;
+    u.lang = this.voice ? this.voice.lang : 'hi-IN';
+    u.rate = 0.92;
+    this.busy = true;
+    u.onend = u.onerror = function () { self.busy = false; setTimeout(function () { self._next(); }, 400); };
+    w.speechSynthesis.speak(u);
+  };
+  if ('speechSynthesis' in w && w.speechSynthesis.addEventListener) {
+    w.speechSynthesis.addEventListener('voiceschanged', function () {});   // loads the voice list early on Chrome
+  }
+
+  /* ── ask the server to fetch town / temple names for new map squares ── */
+  var warmBusy = false, warmTried = {};
+  LF.warmCells = function (cells, key) {
+    if (warmBusy || !cells || !cells.length) return;
+    var now = Date.now();
+    var todo = cells.filter(function (c) { return !warmTried[c] || now - warmTried[c] > 120000; }).slice(0, 2);
+    if (!todo.length) return;
+    todo.forEach(function (c) { warmTried[c] = now; });
+    warmBusy = true;
+    fetch('/api/fleet-places.php?cells=' + encodeURIComponent(todo.join(',')) + (key ? '&key=' + encodeURIComponent(key) : ''),
+      { method: 'POST', credentials: 'same-origin', cache: 'no-store' })
+      .catch(function () {}).then(function () { warmBusy = false; });
+  };
+
+  /* Temples near a bus + its next stops, as map labels. */
+  LF.poisFor = function (b) {
+    var out = [];
+    if (!b) return out;
+    (b.temples || []).forEach(function (t) {
+      out.push({ key: 't' + t.id, icon: '🛕', label: t.name, sub: LF.neKm(t.km), lng: t.lng, lat: t.lat });
+    });
+    return out;
   };
 })(window);

@@ -4,7 +4,7 @@
 --  (includes/livefleet.php, api/driver.php, api/live-fleet.php,
 --   admin/live-fleet.php, admin/live-tv.php, admin/live-setup.php)
 --
---  Additive and re-runnable: five NEW tables and two settings rows.
+--  Additive and re-runnable: six NEW tables and three settings rows.
 --  Nothing that already exists is altered. The old single `livebus`
 --  key keeps working - the new engine writes it too, so the passenger
 --  Trip Companion and the "bus is near" alerts see the same position.
@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS `fleet_trips` (
   `last_lat`        DECIMAL(10,7) NULL,
   `last_lng`        DECIMAL(10,7) NULL,
   `last_speed_kmh`  DECIMAL(6,1) NULL,
+  `avg_speed_kmh`   DECIMAL(6,1) NULL COMMENT 'moving average while moving — the ETA speed',
   `last_heading`    SMALLINT NULL,
   `last_accuracy_m` DECIMAL(8,1) NULL,
   `last_battery`    TINYINT UNSIGNED NULL,
@@ -123,6 +124,31 @@ CREATE TABLE IF NOT EXISTS `fleet_cameras` (
     REFERENCES `buses` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Re-run safety for a database that got the first version of this file.
+SET @have := (SELECT COUNT(*) FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fleet_trips' AND COLUMN_NAME = 'avg_speed_kmh');
+SET @sql := IF(@have = 0,
+  'ALTER TABLE `fleet_trips` ADD COLUMN `avg_speed_kmh` DECIMAL(6,1) NULL AFTER `last_speed_kmh`',
+  'DO 0');   -- no result set: tests/apply-sql.php runs every statement with exec()
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+-- Towns, villages and Hindu temples along the road (OpenStreetMap), one row
+-- per map square of 0.2 degrees (~20 km). Fetched once from Overpass when a
+-- bus first drives into the square, then reused — the live map never waits
+-- on it. data = JSON list of [kind, lat, lng, name_devanagari, name_english].
+CREATE TABLE IF NOT EXISTS `fleet_places` (
+  `cell`        VARCHAR(16) NOT NULL COMMENT 'floor(lat/0.2):floor(lng/0.2)',
+  `status`      ENUM('ok','pending','error') NOT NULL DEFAULT 'pending',
+  `fetched_at`  DATETIME NOT NULL,
+  `n_items`     INT UNSIGNED NOT NULL DEFAULT 0,
+  `data`        MEDIUMTEXT NULL,
+  PRIMARY KEY (`cell`),
+  KEY `ix_fleet_places_status` (`status`,`fetched_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 INSERT IGNORE INTO `settings` (`skey`,`svalue`,`stype`,`sgroup`,`label`,`is_public`) VALUES
 ('fleet_keep_days', '30', 'int',    'liveops', 'Live Fleet: keep the GPS trail of each trip this many days', 0),
-('fleet_tv_key',    '',   'string', 'liveops', 'Live Fleet: secret key in the TV wall link (empty = TV needs a staff login)', 0);
+('fleet_tv_key',    '',   'string', 'liveops', 'Live Fleet: secret key in the TV wall link (empty = TV needs a staff login)', 0),
+('fleet_overpass_url', 'https://overpass-api.de/api/interpreter', 'string', 'liveops', 'Live Fleet: OpenStreetMap Overpass server for town / temple names on the road', 0);

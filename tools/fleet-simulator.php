@@ -95,10 +95,10 @@ $sims = [];
 foreach ($drivers as $n => $spec) {
     [$code, $pin, $bus] = array_pad(explode(':', $spec), 3, '');
     [$c, $j] = call('login', ['code' => $code, 'pin' => $pin]);
-    if ($c !== 200) { fwrite(STDERR, "$code: login failed — " . ($j['error'] ?? $c) . "\n"); exit(1); }
+    if ($c !== 200 || empty($j['ok'])) { fwrite(STDERR, "$code: login failed — " . ($j['error'] ?? $c) . "\n"); exit(1); }
     $token = (string) $j['data']['token'];
     [$c, $j] = call('start', ['bus_id' => (int) $bus], $token);
-    if ($c !== 200) { fwrite(STDERR, "$code: start failed — " . ($j['error'] ?? $c) . "\n"); exit(1); }
+    if ($c !== 200 || empty($j['ok'])) { fwrite(STDERR, "$code: start failed — " . ($j['error'] ?? $c) . "\n"); exit(1); }
     $sims[] = [
         'code' => $code, 'token' => $token, 'bus' => (string) $j['data']['trip']['bus'],
         // Spread the buses along the road; odd ones drive the other way.

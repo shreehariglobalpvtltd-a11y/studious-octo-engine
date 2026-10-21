@@ -88,6 +88,21 @@ body.idle .bar .ctl{opacity:0}
 .info .speed small{font-size:18px;color:var(--mut);font-weight:700}
 .info .stop{font-size:17px;margin-top:8px;line-height:1.45}
 .info .stop b{color:#fff}
+.info .np{font-family:'Noto Sans Devanagari',Inter,system-ui,sans-serif}
+.up{position:absolute;right:20px;top:64px;z-index:3;width:min(380px,40%);background:rgba(11,18,32,.88);backdrop-filter:blur(6px);border:1px solid var(--line);border-radius:16px;padding:12px 14px;font-family:'Noto Sans Devanagari',Inter,system-ui,sans-serif}
+.up h4{margin:0 0 6px;font-size:14px;color:#FFC08A;font-weight:800;letter-spacing:.02em}
+.up .r{display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--line);font-size:15px}
+.up .r:first-of-type{border-top:0}
+.up .r b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.up .r span{color:var(--mut);font-size:13px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.up .r.next b{color:#fff;font-size:17px}
+.up .tm{margin-top:10px}
+.ann{position:absolute;left:50%;top:14px;transform:translateX(-50%);z-index:4;max-width:min(900px,calc(100% - 40px));background:linear-gradient(90deg,#D96A10,#F07C1F);color:#fff;border-radius:14px;padding:10px 18px;
+  font:700 19px/1.4 'Noto Sans Devanagari',Inter,system-ui,sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.45);transition:opacity .5s,transform .5s}
+.ann.off{opacity:0;transform:translate(-50%,-12px);pointer-events:none}
+.vhint{position:fixed;right:22px;bottom:78px;z-index:9;background:#F07C1F;color:#fff;border:0;border-radius:16px;padding:14px 20px;font:800 17px/1.3 'Noto Sans Devanagari',Inter,system-ui,sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.5);cursor:pointer}
+.lf-poi{--lf-poi-bg:#1b2a45;--lf-poi-fg:#fff}
+.lf-poi .lf-poi-i{background:#3b2610}
 .info .lf-pill{font-size:14px;padding:5px 12px}
 .prog{position:absolute;left:0;right:0;top:0;height:4px;z-index:4;background:rgba(255,255,255,.08)}
 .prog i{display:block;height:100%;width:0;background:var(--acc)}
@@ -117,7 +132,7 @@ body.idle .bar .ctl{opacity:0}
 .ticker .tk.cur{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc) inset}
 .ticker .tk i{width:10px;height:10px;border-radius:50%}
 .ticker .tk small{color:var(--mut);font-weight:600}
-@media(max-width:820px){.focus.has-cam{grid-template-columns:1fr;grid-template-rows:1fr 34%}.info{min-width:0;left:10px;right:10px;bottom:10px}.info .nm{font-size:20px}.info .speed{font-size:36px}.bar .counts,.bar .brand span{display:none}}
+@media(max-width:820px){.up{display:none}.focus.has-cam{grid-template-columns:1fr;grid-template-rows:1fr 34%}.info{min-width:0;left:10px;right:10px;bottom:10px}.info .nm{font-size:20px}.info .speed{font-size:36px}.bar .counts,.bar .brand span{display:none}}
 </style>
 </head>
 <body>
@@ -131,6 +146,7 @@ body.idle .bar .ctl{opacity:0}
       <button type="button" data-layout="grid">▦ Grid</button>
       <button type="button" data-layout="all">🗺 All</button>
       <button type="button" id="bPause">⏸ Pause</button>
+      <button type="button" id="bVoice">🔇 आवाज</button>
       <button type="button" id="bFull">⛶ Full screen</button>
     </div>
     <span class="conn" id="conn" title="connection"></span>
@@ -139,6 +155,7 @@ body.idle .bar .ctl{opacity:0}
   <main class="stage" id="stage"></main>
   <footer class="ticker" id="ticker"></footer>
 </div>
+<button type="button" class="vhint" id="vHint" hidden>🔊 घोषणा सुन्न यहाँ थिच्नुहोस्<br><small style="font-weight:600">Tap once to hear Nepali announcements</small></button>
 
 <script src="<?= Security::e(LiveFleet::asset('livefleet.js')) ?>"></script>
 <script>
@@ -159,10 +176,16 @@ body.idle .bar .ctl{opacity:0}
     return road.length ? road : S.buses.filter(function (b) { return b.pos; });
   }
   function byId(id) { for (var i = 0; i < S.buses.length; i++) if (S.buses[i].id === id) return S.buses[i]; return null; }
+  /* 📍 where it is now · ➡️ the town ahead · 🚏 the next stop — in Nepali, km and time. */
   function stopLine(b) {
-    if (!b.stop) return b.route ? esc(b.route.label) : '';
-    return (b.stop.at ? '📍 At <b>' + esc(b.stop.near) + '</b>' : '📍 Near <b>' + esc(b.stop.near) + '</b>')
-      + (b.stop.next ? ' &nbsp;➡️ Next <b>' + esc(b.stop.next) + '</b>' + (b.stop.next_km != null ? ' · ' + b.stop.next_km + ' km' : '') : '');
+    var st = b.stop, out = [];
+    // "Near X" next to "X ahead, 12 km" says the same thing twice — keep the line with the distance.
+    if (b.place && (b.place.at || !b.ahead || b.ahead.name !== b.place.name)) out.push('📍 अहिले <b>' + esc(b.place.name) + '</b>' + (b.place.at ? '' : ' नजिक'));
+    else if (st) out.push('📍 ' + (st.at ? '' : 'नजिक ') + '<b>' + esc(LF.nm(st.near_ne, st.near)) + '</b>');
+    if (b.ahead) out.push('➡️ अगाडि <b>' + esc(b.ahead.name) + '</b> · ' + LF.neKm(b.ahead.km) + ' · ' + LF.neDur(b.ahead.min));
+    if (st && st.next) out.push('🚏 अर्को स्टप <b>' + esc(LF.nm(st.next_ne, st.next)) + '</b> · ' + LF.neKm(st.next_km) + ' · करिब ' + LF.neDur(st.next_min));
+    if (!out.length && b.route) out.push(esc(b.route.label));
+    return out.join('<br>');
   }
   function kmh(b) { return (b.status === 'live' || b.status === 'weak') && b.pos && b.pos.kmh != null ? Math.round(b.pos.kmh) : 0; }
 
@@ -177,7 +200,7 @@ body.idle .bar .ctl{opacity:0}
   function focusView() {
     var root = document.createElement('div');
     root.className = 'focus';
-    root.innerHTML = '<div class="fmap"><div class="prog"><i></i></div><div class="idx" hidden></div><div class="info" hidden></div><div class="splash" hidden></div></div><div class="fcam" hidden><div class="lf-cams"></div></div>';
+    root.innerHTML = '<div class="fmap"><div class="prog"><i></i></div><div class="idx" hidden></div><div class="up" hidden></div><div class="info" hidden></div><div class="splash" hidden></div></div><div class="fcam" hidden><div class="lf-cams"></div></div>';
     stage.appendChild(root);
     var mapEl = document.createElement('div');
     root.querySelector('.fmap').insertBefore(mapEl, root.querySelector('.prog'));
@@ -215,9 +238,22 @@ body.idle .bar .ctl{opacity:0}
         info.innerHTML = '<div class="nm">' + esc(b.name) + '<small>' + esc(b.number) + (b.route ? ' · ' + esc(b.route.label) : '') + '</small></div>'
           + '<div class="row"><span class="speed">' + kmh(b) + ' <small>km/h</small></span>' + LF.pill(b.status, true)
           + (b.battery != null ? '<span style="color:var(--mut)">🔋 ' + b.battery + '%</span>' : '') + '</div>'
-          + '<div class="stop">' + stopLine(b) + '</div>'
+          + '<div class="stop np">' + stopLine(b) + '</div>'
           + '<div class="row" style="color:var(--mut);font-size:14px">' + (b.driver ? '👤 ' + esc(b.driver.name) + ' · ' : '') + 'GPS ' + esc(LF.ago(b.age_s))
           + (b.trip ? ' · ' + b.trip.km + ' km driven' : '') + '</div>';
+        var up = root.querySelector('.up'), ups = b.stop && b.stop.upcoming ? b.stop.upcoming.slice(0, 4) : [];
+        var towns = (b.towns || []).slice(0, ups.length ? 3 : 4);
+        up.hidden = !ups.length && !towns.length && !(b.temples || []).length;
+        var row = function (name, km, min, first) {
+          return '<div class="r' + (first ? ' next' : '') + '"><b>' + esc(name) + '</b><span>' + LF.neKm(km) + ' · ' + LF.neDur(min)
+            + '<br>' + LF.neClock(Date.now() + min * 60000) + '</span></div>';
+        };
+        up.innerHTML = (towns.length ? '<h4>➡️ आउने ठाउँहरू</h4>' + towns.map(function (t, i) { return row(t.name, t.km, t.min, i === 0); }).join('') : '')
+          + (ups.length ? '<div class="tm"><h4>🚏 आउने स्टपहरू</h4>' + ups.map(function (u, i) { return row(LF.nm(u.ne, u.name), u.km, u.min, i === 0 && !towns.length); }).join('') + '</div>' : '')
+          + ((b.temples || []).length ? '<div class="tm"><h4>🛕 नजिकैका मन्दिर</h4>' + b.temples.slice(0, 3).map(function (t) {
+            return '<div class="r"><b>' + esc(t.name) + '</b><span>' + LF.neKm(t.km) + '</span></div>';
+          }).join('') + '</div>' : '');
+        fm.ready.then(function () { fm.setPois(LF.poisFor(b)); }).catch(function () {});
         var cams = b.cameras || [];
         root.classList.toggle('has-cam', cams.length > 0);
         root.querySelector('.fcam').hidden = !cams.length;
@@ -281,8 +317,9 @@ body.idle .bar .ctl{opacity:0}
             t.fm.update([b]);
             if (!t.placed) { t.placed = true; t.fm.map.jumpTo({ center: [b.pos.lng, b.pos.lat], zoom: 13.5 }); t.fm.following = true; t.fm.selected = b.id; }
           }).catch(function () {});
-          t.el.querySelector('.tl').innerHTML = '<div class="t1"><b>' + esc(b.name) + ' · ' + esc(b.number) + '</b><span>' + esc(s.en)
-            + (b.stop ? ' · ' + esc(b.stop.at ? 'At ' + b.stop.near : 'Near ' + b.stop.near) + (b.stop.next ? ' → ' + esc(b.stop.next) : '') : '')
+          t.el.querySelector('.tl').innerHTML = '<div class="t1"><b>' + esc(b.name) + ' · ' + esc(b.number) + '</b><span>' + esc(s.np)
+            + (b.place ? ' · 📍 ' + esc(b.place.name) : '')
+            + (b.stop && b.stop.next ? ' · 🚏 ' + esc(LF.nm(b.stop.next_ne, b.stop.next)) + ' ' + LF.neKm(b.stop.next_km) + ', ' + LF.neDur(b.stop.next_min) : '')
             + ' · GPS ' + esc(LF.ago(b.age_s)) + '</span></div><div class="kmh">' + kmh(b) + ' <small>km/h</small></div>';
           LF.renderCams(t.el.querySelector('.tcam .lf-cams'), (b.cameras || []).slice(0, 1));
         });
@@ -339,7 +376,7 @@ body.idle .bar .ctl{opacity:0}
     tk.innerHTML = S.buses.map(function (b) {
       var s = LF.STATUS[b.status] || LF.STATUS.idle, v = kmh(b);
       return '<span class="tk' + (layout === 'focus' && b.id === S.focusId ? ' cur' : '') + '" data-id="' + b.id + '"><i style="background:' + s.c + '"></i>'
-        + esc(b.number || b.name) + ' <small>' + (v ? v + ' km/h' : esc(s.en)) + (b.stop && b.status !== 'parked' ? ' · ' + esc(b.stop.next || b.stop.near) : '') + '</small></span>';
+        + esc(b.number || b.name) + ' <small>' + (v ? v + ' km/h' : esc(s.np)) + (b.place && b.status !== 'parked' ? ' · ' + esc(b.place.name) : '') + '</small></span>';
     }).join('');
   }
   document.getElementById('ticker').addEventListener('click', function (e) {
@@ -387,6 +424,28 @@ body.idle .bar .ctl{opacity:0}
 
   setLayout(layout);
   if (LOCK) setPaused(true);
+  /* 📢 Nepali announcements: a banner on screen, spoken after one tap on 🔊. */
+  var tracker = new LF.Tracker(), annT = null;
+  var voice = new LF.Announcer(function (text, icon) {
+    var el = stage.querySelector('.ann');
+    if (!el) { el = document.createElement('div'); el.className = 'ann off'; stage.appendChild(el); }
+    el.textContent = (icon || '📢') + ' ' + text;
+    el.classList.remove('off');
+    clearTimeout(annT);
+    annT = setTimeout(function () { el.classList.add('off'); }, 20000);
+  });
+  var bVoice = document.getElementById('bVoice'), vHint = document.getElementById('vHint');
+  function setVoice(on) {
+    on = voice.enable(on);
+    bVoice.classList.toggle('on', on); bVoice.textContent = on ? '🔊 आवाज' : '🔇 आवाज';
+    vHint.hidden = on || !voice.supported();
+    try { localStorage.setItem('lf:tvVoice', on ? '1' : '0'); } catch (e) {}
+  }
+  bVoice.onclick = function () { setVoice(!voice.on); };
+  vHint.onclick = function () { setVoice(true); };
+  // Browsers only speak after a tap: offer the big button unless the TV was told to stay quiet.
+  try { vHint.hidden = !voice.supported() || localStorage.getItem('lf:tvVoice') === '0'; } catch (e) { vHint.hidden = !voice.supported(); }
+
   LF.poll(api, 1000, function (d) {
     S.buses = d.buses;
     S.lastOk = Date.now();
@@ -395,6 +454,8 @@ body.idle .bar .ctl{opacity:0}
     document.getElementById('nOff').textContent = d.counts.offline + d.counts.waiting;
     if (S.view) S.view.update();
     renderTicker();
+    tracker.events(d.buses).forEach(function (ev) { voice.say(ev.text, ev.icon); });
+    if (d.need_cells && d.need_cells.length) LF.warmCells(d.need_cells, KEY);
   }, function (e) {
     if (e && (e.status === 401 || e.status === 403)) {
       stage.innerHTML = '<div class="splash"><div class="big">Signed out</div><div class="sub">Open the TV link again from Live Fleet → Drivers &amp; CCTV.</div></div>';

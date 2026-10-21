@@ -7,15 +7,24 @@ CCTV cameras can be added per bus later — the system is already built for them
 > **नेपालीमा:** ड्राइभरले आफ्नो मोबाइलमा **Driver ID + PIN** ले लगइन गर्छ → बस छान्छ → **Start trip** थिच्छ।
 > त्यसपछि मोबाइलले हरेक सेकेन्ड GPS लोकेसन पठाउँछ। अफिसमा **Admin → Map → Live Fleet** मा सबै बस
 > लाइभ देखिन्छ (हरेक सेकेन्ड रिफ्रेस)। **TV Wall** ले टिभीमा भिडियो जस्तै एक-एक बस घुमाएर देखाउँछ।
+> हरेक ठाउँ पुग्दा नेपालीमा घोषणा हुन्छ — *"भरुच आइपुग्यो। अगाडि वडोदरा — ७० किमी, करिब १ घण्टा।"* —
+> र बाटोमा पर्ने मन्दिरको नाम पनि: *"नजिकै श्री अम्बे माता मन्दिर — ०.९ किमी। जय माता दी!"* (🔊 थिचेपछि आवाजमा पनि)।
 > पछि सीसी क्यामेरा जोड्न **Driver Login & CCTV** पेजमा लिंक हाल्ने मात्र हो।
 
-| Admin — all buses live | TV wall — one bus at a time | Driver phone |
+| Admin — bus, places ahead, stops, announcements | TV wall — Nepali, one bus at a time | Driver phone |
 |---|---|---|
-| ![Admin](docs/screenshots/1-admin-live-fleet.png) | ![TV](docs/screenshots/3-tv-focus.png) | ![Driver](docs/screenshots/9-driver-live.png) |
+| ![Admin](docs/screenshots/2-admin-bus-selected.png) | ![TV](docs/screenshots/3b-tv-route-bus.png) | ![Driver](docs/screenshots/9-driver-live.png) |
 
 *(Screenshots are from the test setup, where internet map tiles were blocked — on the real site the map shows streets.)*
 
 ---
+
+## ⬇️ Download (ready to upload)
+
+**[live-fleet-shreehari.zip](https://github.com/shreehariglobalpvtltd-a11y/studious-octo-engine/raw/claude/bus-live-tracking-9ergy9/dist/live-fleet-shreehari.zip)**
+(~2 MB, works from any account — no login needed). Inside: `1-upload-to-public_html/` (the files), `2-menu/` (5 menu lines),
+`3-database/` (the SQL), `4-tools/` (install + test), and **`PADHNUHOS-PAHILE-YO.md`** — the step-by-step guide in Nepali
+(same as [docs/INSTALL-NEPALI.md](docs/INSTALL-NEPALI.md)). Rebuild it any time with `bash tools/make-package.sh dist`.
 
 ## 1. What you get
 
@@ -27,6 +36,33 @@ CCTV cameras can be added per bus later — the system is already built for them
 | **Setup** | `/admin/live-setup.php` | manager / superadmin | Give drivers a Driver ID + PIN, see & sign out attached phones, add CCTV cameras, make the TV link. |
 
 Status colours: 🟢 **Live** (GPS in the last 20 s) · 🟠 **Weak signal** (20 s – 3 min) · 🔴 **Offline** (trip running, no GPS for 3+ min) · ⚪ **Parked** (trip ended).
+
+### 📢 Nepali live announcements (घोषणा) — places, km, time, temples
+
+For every bus on the road the screens show, **in Nepali**, and update every second:
+
+| Shown | Example | How it is worked out |
+|---|---|---|
+| 📍 where it is now | अहिले **अङ्कलेश्वर** | nearest town / village (OpenStreetMap), Devanagari name when known |
+| ➡️ places ahead | **भरुच** · ११ किमी · १२ मिनेट · बिहान ११:३९ | towns in front of the bus (its GPS heading), road km = straight line × 1.25 |
+| 🚏 stops ahead | **चिलोडा** · १२१ किमी · १ घण्टा ५० मिनेट · दिउँसो १:२१ · … **रुपैडिहा** · भोलि बिहान ९:३३ | the route's stops; time at the bus's **average moving speed** (a tea stop does not spoil it) |
+| 🛕 temples nearby | **श्री अम्बे माता मन्दिर** · ०.९ किमी | Hindu temples within 3 km (OpenStreetMap `religion=hindu`) |
+
+And it **announces** (banner on screen + list on the admin page, **spoken aloud after you tap 🔊 once**):
+
+- `📍 SHG Himalaya Express भरुच आइपुग्यो। अगाडि करजण — ४० किमी, करिब ४० मिनेट।` — every town / village it reaches
+- `🚏 … वडोदरा आइपुग्यो। अर्को स्टप चिलोडा — १२१ किमी, करिब १ घण्टा ५० मिनेट।` — every stop, and again when it leaves
+- `🛕 … नजिकै श्री गणेश मन्दिर — ०.८ किमी। गणपति बाप्पा मोरया!` — each temple within 1 km, once, with a greeting that fits the deity
+  (हर हर महादेव · जय श्री राम · जय श्री कृष्ण · जय माता दी · गणपति बाप्पा मोरया · जय जगन्नाथ · ॐ नमो नारायणाय · otherwise जय श्री हरि)
+- `🕒 … गति ६२ किमी/घण्टा। रुपैडिहा सम्म १४३६ किमी, करिब २२ घण्टा — भोलि बिहान ९:३३ सम्म पुग्ने अनुमान।` — every 15 minutes
+
+Where the names come from: the server asks **OpenStreetMap** (free, Overpass API) once for each ~20 km square a bus drives into,
+saves the towns, villages and Hindu temples in the `fleet_places` table, and reuses them for 90 days — the 1-second refresh never waits for it.
+If your server cannot reach `overpass-api.de`, set another Overpass server in Settings → `fleet_overpass_url`
+(e.g. `https://overpass.kumi.systems/api/interpreter`). Route stops always work, with or without it.
+
+**Voice:** browsers allow speaking only after one tap, so the TV shows a big **🔊 घोषणा सुन्न यहाँ थिच्नुहोस्** button — tap it once after the
+page opens. The voice is Nepali if the device has one, otherwise Hindi (same script, clearly understood).
 
 ## 2. How it works (ground level)
 
@@ -57,25 +93,28 @@ What I found in the current website before building this: **[docs/RESEARCH.md](d
 
 ```
 site/                                  ← copy into the website, same paths
-├── database/upgrade-2026-10-live-fleet.sql   5 new tables (fleet_*) + 2 settings
+├── database/upgrade-2026-10-live-fleet.sql   6 new tables (fleet_*) + 3 settings
 ├── includes/livefleet.php             the engine: login, trips, GPS, status, cameras, TV key
 ├── api/driver.php                     phone ↔ server (login / start / ping / end)
 ├── api/fleet-osmand.php               Traccar Client background tracking
 ├── api/live-fleet.php                 the 1-second map data for admin + TV
+├── api/fleet-places.php               fetches town / temple names (OpenStreetMap) for new map squares
 ├── admin/live-fleet.php               Live Fleet page
 ├── admin/live-tv.php                  TV wall
 ├── admin/live-setup.php               Driver logins, phones, CCTV, TV link
 ├── driver/index.php                   the driver phone app (+ manifest.webmanifest)
 ├── assets/livefleet/livefleet.js|css  shared map + camera player code
 ├── cron/fleet-cleanup.php             hourly: end silent trips, delete old trail points
-└── tests/live-fleet-test.php          77 engine checks
-    tests/live-fleet-http-test.php     29 HTTP checks (phone → server → TV)
+└── tests/live-fleet-test.php          108 engine checks
+    tests/live-fleet-http-test.php     33 HTTP checks (phone → server → TV)
 patches/admin-nav.patch                adds 3 menu items to admin/_guard.php (5 lines)
 tools/install.sh                       copies site/ in + applies the patch
 tools/test-local.sh                    builds a throw-away copy of the website and runs every test
 tools/fleet-simulator.php              fake buses driving NH48, 1 fix/second (for testing)
-tools/fleet-demo-seed.php              3 demo drivers DEMO1–3 / PIN 1234 (test copy only)
+tools/fleet-demo-seed.php              3 demo drivers DEMO1–3 / PIN 1234 + sample NH48 towns & temples (test copy only)
+tools/make-package.sh                  builds the download zip (dist/live-fleet-shreehari.zip)
 docs/CCTV.md                           how to connect bus cameras later
+docs/INSTALL-NEPALI.md                 install guide in Nepali (also in the zip)
 ```
 
 ## 4. Install on the website (step by step)
@@ -92,7 +131,7 @@ tar czf /root/backups/before-live-fleet-$(date +%F).tgz --exclude=uploads .
 git clone https://github.com/shreehariglobalpvtltd-a11y/studious-octo-engine.git /root/live-fleet
 bash /root/live-fleet/tools/install.sh /var/www/shreehariglobal.in/public_html
 
-# 2. database: 5 new tables (nothing existing changes)
+# 2. database: 6 new tables (nothing existing changes)
 php tests/apply-sql.php database/upgrade-2026-10-live-fleet.sql
 
 # 3. hourly cleanup — crontab -e
@@ -135,14 +174,16 @@ php tools/fleet-simulator.php --base=http://127.0.0.1:8899 \
 ```
 
 `--signal-loss=60` makes one bus lose signal for 25 s every minute (you will see 🟠 → 🟢 and the dot catch up).
+The demo seed also fills **sample** towns and temples along NH48, so the Nepali announcements work even without internet;
+`--no-places` skips that. On the real server, real names come from OpenStreetMap by themselves.
 
 What was tested (all passing):
 
 | Check | Result |
 |---|---|
-| `tests/live-fleet-test.php` — login, lock-out, revoke, trips, GPS cleaning, trail, distance, status, next stop, cameras, TV key, cleanup | **77 / 77** |
-| `tests/live-fleet-http-test.php` — real HTTP: phone API, map API auth, TV key, Traccar formats, pages | **29 / 29** |
-| Real browser (Chromium): driver logs in on a phone screen → bus live on admin map; markers glide; TV focus / grid / all; camera tile; trip end | ✅ no console errors |
+| `tests/live-fleet-test.php` — login, lock-out, revoke, trips, GPS cleaning, trail, distance, status, next stop, km + minutes to every stop, Nepali names, average speed, OpenStreetMap towns / temples, cameras, TV key, cleanup | **108 / 108** |
+| `tests/live-fleet-http-test.php` — real HTTP: phone API, map API auth, TV key, places endpoint, Traccar formats, pages | **33 / 33** |
+| Real browser (Chromium): driver logs in on a phone screen → bus live on admin map; markers glide; TV focus / grid / all; camera tile; Nepali announcements (towns, stops, temples); trip end | ✅ no console errors |
 | Site's own suites after install: asset versions 9/9, admin security 27/27, ETA alerts 22/22 | ✅ |
 
 ## 7. Settings & limits

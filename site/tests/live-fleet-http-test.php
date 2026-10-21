@@ -55,7 +55,8 @@ const LFH_BUS = 'LF-HTTP-0001';
 $cleanup = static function (): void {
     Database::run("DELETE FROM buses WHERE bus_number = '" . LFH_BUS . "'");
     Database::run("DELETE FROM drivers WHERE full_name = 'LF Http Driver'");
-    Database::run("DELETE FROM rate_limits WHERE bucket IN ('fleet_login_ip', 'fleet_login_code')");
+    Database::run("DELETE FROM rate_limits WHERE bucket IN ('fleet_login_ip', 'fleet_login_code', 'fleet_places')");
+    Database::run("DELETE FROM fleet_places WHERE cell = '52:52'");
 };
 $cleanup();
 $tvBefore = LiveFleet::tvKey();
@@ -114,6 +115,17 @@ try {
     check('?trail= returns the trip\'s breadcrumbs', $c === 200 && ($j['data']['trail']['trip'] ?? 0) === ($b['trip']['id'] ?? -1) && count($j['data']['trail']['points'] ?? []) >= 1);
     [, , $raw] = http('GET', $BASE . '/api/live-fleet.php?key=' . $key);
     check('the answer is small enough for a 1 s refresh', strlen($raw) < 20000, strlen($raw) . ' bytes');
+
+    check('the answer lists the map squares still to fetch', is_array($j['data']['need_cells'] ?? null));
+
+    echo "-- town / temple names endpoint --\n";
+    [$c] = http('GET', $BASE . '/api/fleet-places.php?cells=52:52&key=' . $key);
+    check('GET is refused (POST only)', $c === 405, (string) $c);
+    [$c] = http('POST', $BASE . '/api/fleet-places.php?cells=52:52', []);
+    check('no staff session, no key → 401', $c === 401, (string) $c);
+    LiveFleet::storeCell('52:52', [['temple', 10.45, 10.45, 'शिव मन्दिर', 'Shiv Mandir', 'n9']]);
+    [$c, $j] = http('POST', $BASE . '/api/fleet-places.php?cells=' . rawurlencode('52:52,drop table') . '&key=' . $key, []);
+    check('a cached square is answered "cached" without asking OpenStreetMap; junk ignored', $c === 200 && ($j['data']['cells'] ?? null) === ['52:52' => 'cached'], json_encode($j));
 
     echo "-- Traccar Client (background mode) --\n";
     $t = time();

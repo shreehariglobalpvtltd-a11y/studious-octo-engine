@@ -17,6 +17,9 @@
  *    - status: live → weak → offline by age, parked after End, idle
  *    - next-stop logic on a real route, CCTV link rules, TV key, cleanup
  *    - the legacy `livebus` key is fed while one bus is live
+ *    - Nepali journey: road km + minutes to every stop ahead, Devanagari
+ *      names, moving-average speed, OpenStreetMap towns / Hindu temples
+ *      (parsing, cache squares, "in town", "town ahead", fetch claiming)
  *
  *  Everything it creates is deleted again (buses / drivers cascade).
  *
@@ -46,9 +49,14 @@ if (!Database::exists("SELECT 1 FROM information_schema.tables WHERE table_schem
 
 const LF_BUS = 'LF-TEST-0001';
 const LF_BUS2 = 'LF-TEST-0002';
+const LF_ROUTE = 'LFT9';
+// Test squares sit at 10°N 10°E — far from any road this company drives.
+const LF_CELLS = ['50:50', '50:51', '51:50', '51:51'];
 $cleanup = static function (): void {
     Database::run("DELETE FROM buses WHERE bus_number IN ('" . LF_BUS . "','" . LF_BUS2 . "')");
     Database::run("DELETE FROM drivers WHERE full_name LIKE 'LF Test %'");
+    Database::run("DELETE FROM routes WHERE route_code = '" . LF_ROUTE . "'");
+    Database::run("DELETE FROM fleet_places WHERE cell IN ('" . implode("','", LF_CELLS) . "')");
 };
 $cleanup();
 $legacy = Database::fetch("SELECT kvalue, updated_by FROM kv_store WHERE kscope = 'global' AND kkey = 'livebus'");
@@ -194,6 +202,95 @@ try {
         $past = LiveFleet::stopInfo($route['id'], $lat, $lng);
         check('just past a stop → next is the stop after it', $past['next'] === $s2['stop_name'], json_encode($past, JSON_UNESCAPED_UNICODE));
     }
+
+    echo "-- Nepali journey: km and time to each stop --\n";
+    check('ETA: 62 km at 62 km/h = 60 min', LiveFleet::etaMinutes(62, 62.0) === 60);
+    check('ETA: unknown speed is read as 40 km/h, 120 km/h capped at 70', LiveFleet::etaMinutes(20, null) === 30 && LiveFleet::etaMinutes(35, 120.0) === 30);
+    check('Nepali name from a long stop name', LiveFleet::nepaliName('S Hari Parking, Nana Chiloda (Amd)') === 'चिलोडा');
+    check('Nepali name: "Vadodara · Ajwa Cross" → वडोदरा', LiveFleet::nepaliName('Vadodara · Ajwa Cross') === 'वडोदरा');
+    check('Nepali name: unknown place → empty, Devanagari kept as is', LiveFleet::nepaliName('Emliville') === '' && LiveFleet::nepaliName('बुटवल') === 'बुटवल');
+
+    $rid = Database::insert('routes', ['route_code' => LF_ROUTE, 'from_city' => 'Surat', 'to_city' => 'Mehsana', 'dep_time' => '13:00:00', 'arr_time' => '20:00:00', 'is_active' => 0]);
+    $rs = [['boarding', 'Surat', 21.1702, 72.8311], ['boarding', 'Vadodara · Ajwa Cross', 22.3072, 73.1812], ['boarding', 'Vadodara', 22.3073, 73.1813],
+           ['drop', 'Ahmedabad', 23.0225, 72.5714], ['drop', 'Mehsana', 23.6009, 72.3807]];
+    foreach ($rs as $i => [$type, $name, $la, $ln]) {
+        Database::insert('route_stops', ['route_id' => $rid, 'stop_type' => $type, 'stop_name' => $name, 'latitude' => $la, 'longitude' => $ln, 'sort_order' => $i + 1]);
+    }
+    $j = LiveFleet::stopInfo($rid, 21.1702, 72.8311, 60.0);
+    $legKm = round(LiveFleet::haversineKm(21.1702, 72.8311, 22.3072, 73.1812) * LiveFleet::ROAD_FACTOR, 1);
+    check('at Surat: next is Vadodara, in road km', $j['at'] && $j['next'] === 'Vadodara · Ajwa Cross' && abs($j['next_km'] - $legKm) < 0.2, json_encode([$j['next_km'], $legKm]));
+    check('...with its Nepali name and minutes at 60 km/h', $j['next_ne'] === 'वडोदरा' && $j['next_min'] === LiveFleet::etaMinutes($legKm, 60.0), (string) $j['next_min']);
+    check('the same place listed twice in a row counts once', count($j['upcoming']) === 3 && $j['upcoming'][1]['name'] === 'Ahmedabad', json_encode(array_column($j['upcoming'], 'name')));
+    check('km add up stop by stop to Mehsana', $j['upcoming'][2]['km'] > $j['upcoming'][1]['km'] && $j['upcoming'][1]['km'] > $j['upcoming'][0]['km']);
+    $at = LiveFleet::stopInfo($rid, 22.3072, 73.1812, 60.0);
+    check('at Vadodara the next stop is Ahmedabad, not Vadodara again', $at['at'] && $at['next'] === 'Ahmedabad', $at['next']);
+
+    echo "-- OpenStreetMap towns and Hindu temples --\n";
+    $fixture = ['elements' => [
+        ['type' => 'node', 'id' => 1, 'lat' => 10.05, 'lon' => 10.05, 'tags' => ['place' => 'town', 'name' => 'Testpur', 'name:hi' => 'टेस्टपुर']],
+        ['type' => 'node', 'id' => 2, 'lat' => 10.20, 'lon' => 10.05, 'tags' => ['place' => 'city', 'name' => 'Aagenagar']],
+        ['type' => 'node', 'id' => 3, 'lat' => 10.06, 'lon' => 10.0505, 'tags' => ['place' => 'village', 'name' => 'गाउँ']],
+        ['type' => 'way', 'id' => 4, 'center' => ['lat' => 10.0545, 'lon' => 10.05], 'tags' => ['amenity' => 'place_of_worship', 'religion' => 'hindu', 'name' => 'Shiv Mandir']],
+        ['type' => 'node', 'id' => 5, 'lat' => 10.07, 'lon' => 10.05, 'tags' => ['amenity' => 'place_of_worship', 'religion' => 'hindu', 'name' => 'Ram Mandir', 'name:hi' => 'राम मन्दिर']],
+        ['type' => 'node', 'id' => 6, 'lat' => 10.051, 'lon' => 10.05, 'tags' => ['amenity' => 'place_of_worship', 'religion' => 'christian', 'name' => 'St Mary']],
+        ['type' => 'node', 'id' => 7, 'lat' => 10.052, 'lon' => 10.05, 'tags' => ['amenity' => 'place_of_worship', 'religion' => 'hindu']],
+        ['type' => 'node', 'id' => 8, 'lat' => 10.053, 'lon' => 10.05, 'tags' => ['place' => 'hamlet', 'name' => 'Tiny']],
+    ]];
+    $items = LiveFleet::parseOverpass($fixture);
+    check('Overpass: 2 towns, 1 village, 2 Hindu temples kept; church, nameless temple, hamlet dropped', count($items) === 5, json_encode(array_column($items, 4)));
+    $byId = array_column($items, null, 5);
+    check('Hindi name preferred for Devanagari, English kept beside it', $byId['n1'][3] === 'टेस्टपुर' && $byId['n1'][4] === 'Testpur');
+    check('a Devanagari-only name stays Devanagari', $byId['n3'][3] === 'गाउँ' && $byId['n3'][4] === '');
+    check('a temple drawn as an area gets its centre point', $byId['w4'][0] === 'temple' && abs($byId['w4'][1] - 10.0545) < 1e-6);
+
+    check('square of 10.05°N 10.05°E is 50:50', LiveFleet::cellOf(10.05, 10.05) === '50:50' && LiveFleet::cellOf(-0.1, -0.1) === '-1:-1');
+    check('a square is fetched with a margin', LiveFleet::cellBox('50:50') === [9.95, 9.95, 10.25, 10.25]);
+    check('a bad square name is refused before any request', LiveFleet::fetchCell('x;drop') === 'bad');
+    $calls = 0;
+    $ok = LiveFleet::fetchCell('50:50', function (string $url, string $q) use (&$calls, $fixture): ?string {
+        $calls++;
+        return str_contains($q, '9.95,9.95,10.25,10.25') && str_contains($q, 'religion') ? json_encode($fixture) : null;
+    });
+    check('fetchCell asks Overpass for that box and caches the answer', $ok === 'ok' && $calls === 1
+        && (int) Database::scalar("SELECT n_items FROM fleet_places WHERE cell = '50:50'") === 5);
+    Database::run("UPDATE fleet_places SET status = 'pending', fetched_at = :t WHERE cell = '50:51'", ['t' => date('Y-m-d H:i:s')]);
+    LiveFleet::storeCell('50:51', [], 'pending');
+    check('a square another screen is fetching right now is not fetched twice', LiveFleet::fetchCell('50:51', function () use (&$calls) { $calls++; return null; }) === 'pending' && $calls === 1);
+    check('a failed fetch is stored as error, not thrown', LiveFleet::fetchCell('51:51', fn() => null) === 'error'
+        && Database::scalar("SELECT status FROM fleet_places WHERE cell = '51:51'") === 'error');
+
+    $n = LiveFleet::placesNear(10.05, 10.05, 0, 50.0, 60.0);
+    check('in Testpur (Devanagari name)', ($n['place']['name'] ?? '') === 'टेस्टपुर' && $n['place']['at'] === true, json_encode($n['place'], JSON_UNESCAPED_UNICODE));
+    check('the town ahead (north) is Aagenagar, road km and minutes', ($n['ahead']['name'] ?? '') === 'Aagenagar'
+        && abs($n['ahead']['km'] - round(LiveFleet::haversineKm(10.05, 10.05, 10.20, 10.05) * LiveFleet::ROAD_FACTOR, 1)) < 0.2
+        && $n['ahead']['min'] === LiveFleet::etaMinutes($n['ahead']['km'], 60.0), json_encode($n['ahead'], JSON_UNESCAPED_UNICODE));
+    check('temples within 3 km, nearest first, ahead flagged', array_column($n['temples'], 'id') === ['w4', 'n5'] && $n['temples'][0]['ahead'] === true
+        && $n['temples'][1]['name'] === 'राम मन्दिर', json_encode($n['temples'], JSON_UNESCAPED_UNICODE));
+    $in = LiveFleet::placesNear(10.032, 10.05, 0, 50.0);
+    check('2 km before Testpur\'s centre: in Testpur, and only Aagenagar is ahead', ($in['place']['name'] ?? '') === 'टेस्टपुर'
+        && array_column($in['ahead_list'], 'name') === ['Aagenagar'], json_encode(array_column($in['ahead_list'], 'name'), JSON_UNESCAPED_UNICODE));
+    $south = LiveFleet::placesNear(10.05, 10.05, 180, 50.0);
+    check('driving south, nothing is "ahead"', $south['ahead'] === null);
+    check('the square ahead that is not cached yet is asked for', LiveFleet::placesNear(10.18, 10.05, 0, 50.0)['need'] === ['51:50']);
+    check('a cached square is not asked for again', LiveFleet::placesNear(10.05, 10.05, null, 50.0)['need'] === []);
+
+    echo "-- moving-average speed --\n";
+    $devS = LiveFleet::device((string) LiveFleet::login($codeA, '4821')['token']);
+    LiveFleet::startTrip($devS, $busId);
+    $t1 = time() - 200;
+    $pts = [];
+    for ($i = 0; $i < 120; $i++) { $pts[] = ['lat' => 10.0 + $i * 0.0002, 'lng' => 10.05, 'ts' => ($t1 + $i) * 1000, 'spd' => 20.0, 'acc' => 6, 'hdg' => 0]; }
+    LiveFleet::ping($devS, $pts, null, $t1 + 120);
+    $avg1 = (float) Database::scalar("SELECT avg_speed_kmh FROM fleet_trips WHERE device_id = :v AND status = 'running'", ['v' => (int) $devS['id']]);
+    LiveFleet::ping($devS, [['lat' => 10.024, 'lng' => 10.05, 'ts' => ($t1 + 121) * 1000, 'spd' => 0, 'acc' => 6]], null, $t1 + 121);
+    $avg2 = (float) Database::scalar("SELECT avg_speed_kmh FROM fleet_trips WHERE device_id = :v AND status = 'running'", ['v' => (int) $devS['id']]);
+    check('steady 72 km/h → average 72', abs($avg1 - 72.0) < 0.5, (string) $avg1);
+    check('a halt does not pull the ETA speed down', $avg2 === $avg1);
+    $snap = LiveFleet::snapshot(false, $t1 + 121);
+    $b = $find($snap);
+    check('the live map carries the town, the town ahead and the temples', ($b['place']['name'] ?? '') !== '' && is_array($b['temples']) && array_key_exists('ahead', $b), json_encode($b['place'] ?? null, JSON_UNESCAPED_UNICODE));
+    check('...and the squares still to fetch', is_array($snap['need_cells']));
+    LiveFleet::endTrip($devS);
 
     echo "-- legacy livebus key --\n";
     $far = time() + 86400 * 400;   // a clock where no other trip in this database is recent
