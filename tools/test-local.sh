@@ -68,9 +68,11 @@ suite() {
 echo "== syntax"
 find "$SRC" "$TOOLS" -name '*.php' -print0 | xargs -0 -n1 php -l | grep -v '^No syntax errors' || true
 node --check "$SRC/assets/livefleet/livefleet.js"
+node --check "$SRC/assets/livefleet/overlay.js"
 
 echo "== engine tests"
 suite tests/live-fleet-test.php
+suite tests/live-fleet-vehicles-test.php
 
 echo "== HTTP tests (php -S 127.0.0.1:$PORT)"
 php -S "127.0.0.1:$PORT" -t "$WORK" >"$WORK/logs/devserver.log" 2>&1 &

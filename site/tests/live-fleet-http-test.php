@@ -11,7 +11,10 @@
  *  Pins: login refusals, the token as the only key, 409 before Start,
  *  the live answer reaching the map API, the map API shut without a
  *  staff session or TV key, the TV key hiding driver phones, both
- *  Traccar formats, logout, and the pages answering.
+ *  Traccar formats, logout, and the pages answering. Then: a driver's
+ *  SOS reaching the office and cleared by the phone, the passenger link
+ *  (one bus, nothing private, noindex), replay, and a bus phone paired
+ *  by code that only ever tracks its own vehicle number.
  * =====================================================================
  */
 declare(strict_types=1);
@@ -26,6 +29,19 @@ function check(string $l, bool $ok, string $extra = ''): void {
     global $PASS, $FAIL;
     if ($ok) { $PASS++; echo "  \033[32mPASS\033[0m  $l" . ($extra !== '' ? " — $extra" : '') . "\n"; }
     else     { $FAIL++; echo "  \033[31mFAIL\033[0m  $l" . ($extra !== '' ? " — $extra" : '') . "\n"; }
+}
+/** The response headers of a GET, lower-cased names. @return array<string,string> */
+function headersOf(string $url): array {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HEADER => true, CURLOPT_NOBODY => false, CURLOPT_TIMEOUT => 20]);
+    $raw = (string) curl_exec($ch);
+    $len = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+    $out = [];
+    foreach (explode("\n", substr($raw, 0, $len)) as $line) {
+        if (str_contains($line, ':')) { [$k, $v] = explode(':', $line, 2); $out[strtolower(trim($k))] = trim($v); }
+    }
+    return $out;
 }
 /** @return array{0:int,1:mixed,2:string} status, decoded JSON, raw body */
 function http(string $method, string $url, mixed $json = null, array $headers = []): array {
@@ -52,10 +68,11 @@ if ($c === 0) {
 }
 
 const LFH_BUS = 'LF-HTTP-0001';
+const LFH_BUS2 = 'LF-HTTP-0002';
 $cleanup = static function (): void {
-    Database::run("DELETE FROM buses WHERE bus_number = '" . LFH_BUS . "'");
+    Database::run("DELETE FROM buses WHERE bus_number IN ('" . LFH_BUS . "', '" . LFH_BUS2 . "')");
     Database::run("DELETE FROM drivers WHERE full_name = 'LF Http Driver'");
-    Database::run("DELETE FROM rate_limits WHERE bucket IN ('fleet_login_ip', 'fleet_login_code', 'fleet_places')");
+    Database::run("DELETE FROM rate_limits WHERE bucket IN ('fleet_login_ip', 'fleet_login_code', 'fleet_places', 'fleet_pair_ip', 'fleet_share')");
     Database::run("DELETE FROM fleet_places WHERE cell = '52:52'");
 };
 $cleanup();
@@ -153,6 +170,44 @@ try {
     [$c] = http('GET', $BASE . '/admin/live-tv.php?key=' . strrev($key));
     check('...and refuses a stale key', $c === 403);
 
+    echo "-- driver reports reach the office --\n";
+    [$c, $j] = drv('event', ['type' => 'sos'], $token);
+    $sos = (int) ($j['data']['id'] ?? 0);
+    check('SOS from the phone → a report id', $c === 200 && $sos > 0, json_encode($j));
+    [$c, $j] = drv('event', ['type' => 'party'], $token);
+    check('an unknown report → 400', $c === 400, (string) $c);
+    [, $j] = http('GET', $BASE . '/api/live-fleet.php?key=' . $key);
+    $b = $findBus($j);
+    check('the TV sees the SOS, red, first', ($b['alerts'][0]['key'] ?? '') === 'sos:' . $sos && ($b['alerts'][0]['level'] ?? '') === 'red');
+    [$c, $j] = drv('me', [], $token);
+    check('me → the open report (for the ✓ button after a reload) and the speed limit', ($j['data']['open'][0]['id'] ?? 0) === $sos && is_int($j['data']['limit'] ?? null)
+        && count($j['data']['events'] ?? []) === 5);
+    [$c] = http('POST', $BASE . '/api/live-fleet.php?key=' . $key, ['action' => 'resolve', 'id' => $sos]);
+    check('the TV link cannot resolve a report (read-only)', $c === 403, (string) $c);
+    [$c] = http('POST', $BASE . '/api/live-fleet.php', ['action' => 'resolve', 'id' => $sos]);
+    check('a guest cannot either', $c === 401, (string) $c);
+    [$c, $j] = drv('clear', ['id' => 999999999], $token);
+    check('a phone cannot clear a report of another trip', $c === 200 && ($j['data']['cleared'] ?? true) === false);
+    [$c, $j] = drv('clear', ['id' => $sos], $token);
+    check('the phone clears its own report', $c === 200 && ($j['data']['cleared'] ?? false) === true);
+
+    echo "-- the passenger link --\n";
+    $share = (string) Database::scalar("SELECT share_token FROM fleet_trips WHERE bus_id = :b AND status = 'running'", ['b' => $busId]);
+    [$c, $j] = http('GET', $BASE . '/api/live-fleet.php?share=' . $share);
+    check('no login: the passenger sees that bus, running', $c === 200 && ($j['data']['state'] ?? '') === 'running' && ($j['data']['bus']['id'] ?? 0) === $busId);
+    check('...without the phone, battery, alerts or the driver\'s number', !array_key_exists('phone', $j['data']['bus'] ?? ['phone' => 1])
+        && !array_key_exists('battery', $j['data']['bus']) && !array_key_exists('alerts', $j['data']['bus']) && ($j['data']['bus']['driver']['phone'] ?? 'x') === '');
+    check('...and the API says noindex', str_contains(headersOf($BASE . '/api/live-fleet.php?share=' . $share)['x-robots-tag'] ?? '', 'noindex'));
+    [$c, $j] = http('GET', $BASE . '/api/live-fleet.php?share=' . str_repeat('0', 24));
+    check('a made-up token → nothing', $c === 200 && ($j['data']['state'] ?? '') === 'unknown' && !isset($j['data']['bus']));
+    [$c, , $raw] = http('GET', $BASE . '/bus-live.php?t=' . $share);
+    check('bus-live.php opens, noindex', $c === 200 && str_contains($raw, 'noindex') && str_contains($raw, 'livefleet.js'));
+    [$c, $j] = http('GET', $BASE . '/api/live-fleet.php?key=' . $key . '&trips=' . $busId);
+    $tripId = (int) ($j['data']['trips'][0]['id'] ?? 0);
+    check('?trips= lists the bus\'s trips', $c === 200 && $tripId > 0);
+    [$c, $j] = http('GET', $BASE . '/api/live-fleet.php?key=' . $key . '&replay=' . $tripId);
+    check('?replay= gives every point [ms, lng, lat, km/h, heading]', $c === 200 && count($j['data']['points'][0] ?? []) === 5 && ($j['data']['trip']['id'] ?? 0) === $tripId);
+
     echo "-- end and logout --\n";
     [$c, $j] = drv('end', [], $token);
     check('End → ended', $c === 200 && ($j['data']['ended'] ?? false) === true);
@@ -161,6 +216,35 @@ try {
     [$c] = drv('logout', [], $token);
     [$c2] = drv('me', [], $token);
     check('after logout the token is dead', $c === 200 && $c2 === 401);
+
+    echo "-- a bus phone, paired by code --\n";
+    $bus2 = Database::insert('buses', ['bus_number' => LFH_BUS2, 'bus_name' => 'LF Http Coach 2', 'coach_type' => 'sleeper', 'total_seats' => 30, 'is_active' => 1]);
+    LiveFleet::assignDriver($bus2, $drvId);
+    [$c] = drv('pair', ['code' => '000000']);
+    check('a wrong code → 401', $c === 401, (string) $c);
+    $pc = LiveFleet::createPairCode($bus2);
+    [$c, $j] = drv('pair', ['code' => $pc['code']]);
+    $vt = (string) ($j['data']['token'] ?? '');
+    check('the right code → a bus-phone token for that vehicle', $c === 200 && strlen($vt) === 64 && ($j['data']['kind'] ?? '') === 'vehicle'
+        && ($j['data']['bus']['number'] ?? '') === LFH_BUS2 && ($j['data']['driver']['name'] ?? '') === 'LF Http Driver', json_encode([$j['data']['kind'] ?? null, $j['data']['bus'] ?? null]));
+    [$c] = drv('pair', ['code' => $pc['code']]);
+    check('the code works once', $c === 401);
+    [$c, $j] = drv('start', ['bus_id' => $busId], $vt);
+    check('a bus phone starts its own bus, whatever it asks', $c === 200 && ($j['data']['trip']['bus_id'] ?? 0) === $bus2);
+    [$c, $j] = drv('ping', ['points' => [['lat' => 22.4, 'lng' => 73.1, 'spd' => 5, 'acc' => 6, 'alt' => 33]], 'battery' => 90,
+        'meta' => ['charging' => true, 'net' => 'wifi', 'visible' => true]], $vt);
+    [, $j] = http('GET', $BASE . '/api/live-fleet.php?key=' . $key);
+    $b2 = null;
+    foreach ($j['data']['buses'] ?? [] as $x) { if ($x['id'] === $bus2) { $b2 = $x; } }
+    check('the office sees it by vehicle number with the phone\'s state', ($b2['number'] ?? '') === LFH_BUS2 && ($b2['phone']['kind'] ?? '') === 'vehicle'
+        && ($b2['phone']['net'] ?? '') === 'wifi' && ($b2['phone']['charging'] ?? null) === true, json_encode($b2['phone'] ?? null));
+    [$c, , $raw] = http('GET', $BASE . '/driver/?pair=123456');
+    check('driver/?pair= opens on the bus-phone tab with the code filled in', $c === 200 && str_contains($raw, 'value="123456"') && str_contains($raw, 'Bus phone'));
+    drv('end', [], $vt);
+    [$c] = http('GET', $BASE . '/admin/live-install.php');
+    check('the web installer sends a guest to the login page', $c === 302, (string) $c);
+    [$c] = http('GET', $BASE . '/admin/live-setup.php');
+    check('so does Vehicles & Drivers', $c === 302, (string) $c);
 } catch (Throwable $e) {
     check('no unexpected exception', false, get_class($e) . ': ' . $e->getMessage());
 } finally {

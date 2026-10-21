@@ -11,10 +11,15 @@
  *                   it, and it moves on to the next bus every ?rotate=20 s
  *   ?layout=grid    every bus in its own tile (map + camera), up to 9
  *   ?layout=all     the whole fleet on one map
+ *   ?layout=board   a railway-station departure board: every vehicle number,
+ *                   where it is, next stop, km, expected time, on time / late
  *   ?bus=<id>       lock focus on one bus (no rotation)
  *   ?key=<tv key>   open without a staff login (admin/live-setup.php)
  *
- * Keys: ← → previous / next bus · Space pause rotation · 1 2 3 layout · F full screen
+ * Keys: ← → previous / next bus · Space pause rotation · 1 2 3 4 layout · F full screen
+ *
+ * A driver's SOS or breakdown report takes over the screen: a red banner
+ * on every layout, a siren, and (one-bus layout) the map jumps to that bus.
  */
 declare(strict_types=1);
 require __DIR__ . '/_guard.php';
@@ -34,7 +39,7 @@ if (session_status() === PHP_SESSION_ACTIVE) {
 }
 LiveFleet::allowCameraOrigins();
 
-$layout  = in_array($_GET['layout'] ?? '', ['focus', 'grid', 'all'], true) ? (string) $_GET['layout'] : 'focus';
+$layout  = in_array($_GET['layout'] ?? '', ['focus', 'grid', 'all', 'board'], true) ? (string) $_GET['layout'] : 'focus';
 $rotate  = max(5, min(600, (int) ($_GET['rotate'] ?? 20)));
 $lockBus = max(0, (int) ($_GET['bus'] ?? 0));
 $company = Settings::getString('company_name', APP_NAME);
@@ -56,9 +61,10 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family
 body.idle{cursor:none}
 .tv{display:grid;grid-template-rows:64px 1fr 58px;height:100vh}
 .tv.no-ticker{grid-template-rows:64px 1fr}
+.tv.no-ticker .ticker{display:none}
 .bar{display:flex;align-items:center;gap:14px;padding:0 20px;background:linear-gradient(90deg,#12264E,#1C3B72);box-shadow:0 2px 14px rgba(0,0,0,.4);z-index:5}
 .bar .brand{font-weight:800;font-size:19px;white-space:nowrap;display:flex;align-items:center;gap:10px}
-.bar .brand img{width:34px;height:34px;background:#fff;border-radius:9px;padding:3px}
+.bar .brand .logo{height:48px;width:auto;background:#fff;border-radius:10px;padding:3px 9px;box-shadow:0 2px 8px rgba(0,0,0,.25)}
 .bar .brand span{color:#FFC08A;font-size:12px;letter-spacing:.12em;text-transform:uppercase}
 .bar .counts{display:flex;gap:8px;margin-left:8px}
 .bar .counts span{display:inline-flex;align-items:center;gap:6px;font-weight:800;font-size:14px;background:rgba(255,255,255,.08);padding:5px 11px;border-radius:999px}
@@ -132,19 +138,44 @@ body.idle .bar .ctl{opacity:0}
 .ticker .tk.cur{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc) inset}
 .ticker .tk i{width:10px;height:10px;border-radius:50%}
 .ticker .tk small{color:var(--mut);font-weight:600}
-@media(max-width:820px){.up{display:none}.focus.has-cam{grid-template-columns:1fr;grid-template-rows:1fr 34%}.info{min-width:0;left:10px;right:10px;bottom:10px}.info .nm{font-size:20px}.info .speed{font-size:36px}.bar .counts,.bar .brand span{display:none}}
+.info .top{display:flex;gap:14px;align-items:center}
+.info .bimg{width:128px;height:72px;object-fit:cover;border-radius:12px;background:#fff;flex:0 0 auto;box-shadow:0 4px 14px rgba(0,0,0,.4)}
+.info .hl{font:600 15px/1.5 'Noto Sans Devanagari',Inter,system-ui,sans-serif;color:#dbe4f3;margin-top:8px}
+.info .lf-alert{font-family:'Noto Sans Devanagari',Inter,system-ui,sans-serif}
+.alarm{position:fixed;left:0;right:0;top:64px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:8px 16px;background:#b91c1c;color:#fff;font:800 18px/1.35 'Noto Sans Devanagari',Inter,system-ui,sans-serif;animation:tvAlarm 1s ease-in-out infinite;z-index:8;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.45)}
+.alarm .lf-plate{transform:translateY(-1px)}
+@keyframes tvAlarm{50%{background:#ef4444}}
+/* the red bar sits over the top of the stage: move what lives there below it */
+body.has-alarm .ann{top:62px}
+body.has-alarm .up{top:112px}
+body.has-alarm .idx,body.has-alarm .prog{top:48px}
+body.has-alarm .board{padding-top:56px}
+/* board — a railway departure board */
+.board{position:absolute;inset:0;background:#05070d;padding:10px 16px;overflow:hidden;font-family:'Noto Sans Devanagari',Inter,system-ui,sans-serif}
+.board table{width:100%;border-collapse:collapse;table-layout:fixed}
+.board th{color:#FFC08A;font-size:14px;font-weight:800;text-align:left;padding:8px 10px;border-bottom:2px solid #5a3a12;white-space:nowrap}
+.board td{padding:9px 10px;font-size:19px;font-weight:700;color:#ffd166;border-bottom:1px solid #1a2233;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
+.board td.w{color:#fff}
+.board td small{display:block;font-size:13px;color:#93a4be;font-weight:600;overflow:hidden;text-overflow:ellipsis}
+.board td .chip{display:inline-block;padding:3px 10px;border-radius:999px;color:#fff;font-size:15px}
+.board tr.red td{background:rgba(220,38,38,.18)}
+.board .pg{position:absolute;right:18px;bottom:8px;color:#93a4be;font-size:13px}
+.board .none{color:#93a4be;text-align:center;padding:60px 0;font-size:24px}
+.ticker .tk .lf-plate{transform:translateY(-1px)}
+@media(max-width:820px){.board td:nth-child(n+6),.board th:nth-child(n+6){display:none}.info .bimg{width:84px;height:48px}.up{display:none}.focus.has-cam{grid-template-columns:1fr;grid-template-rows:1fr 34%}.info{min-width:0;left:10px;right:10px;bottom:10px}.info .nm{font-size:20px}.info .speed{font-size:36px}.bar .counts,.bar .brand span{display:none}}
 </style>
 </head>
 <body>
 <div class="tv" id="tv">
   <header class="bar">
-    <div class="brand"><img src="/assets/img/logo.png" alt=""><?= Security::e($company) ?> <span>Live Fleet</span></div>
+    <div class="brand"><img class="logo" src="<?= Security::e(LiveFleet::asset('shg-logo.svg')) ?>" alt="<?= Security::e($company) ?>"> <span>Live Fleet</span></div>
     <div class="counts"><span><i style="background:#16a34a"></i><b id="nLive">0</b></span><span><i style="background:#f59e0b"></i><b id="nWeak">0</b></span><span><i style="background:#dc2626"></i><b id="nOff">0</b></span></div>
     <div class="sp"></div>
     <div class="ctl">
       <button type="button" data-layout="focus">▶ One bus</button>
       <button type="button" data-layout="grid">▦ Grid</button>
       <button type="button" data-layout="all">🗺 All</button>
+      <button type="button" data-layout="board">🚉 Board</button>
       <button type="button" id="bPause">⏸ Pause</button>
       <button type="button" id="bVoice">🔇 आवाज</button>
       <button type="button" id="bFull">⛶ Full screen</button>
@@ -152,6 +183,7 @@ body.idle .bar .ctl{opacity:0}
     <span class="conn" id="conn" title="connection"></span>
     <div class="clock" id="clock">--:--<small></small></div>
   </header>
+  <div class="alarm" id="alarm" hidden></div>
   <main class="stage" id="stage"></main>
   <footer class="ticker" id="ticker"></footer>
 </div>
@@ -166,7 +198,9 @@ body.idle .bar .ctl{opacity:0}
   var LOCK = <?= $lockBus ?>;
   var layout = <?= Security::jsonForHtml($layout) ?>;
   var stage = document.getElementById('stage');
-  var S = { buses: [], focusId: LOCK || null, paused: !!LOCK, rotT0: Date.now(), lastOk: 0, view: null };
+  var S = { buses: [], focusId: LOCK || null, paused: !!LOCK, rotT0: Date.now(), lastOk: 0, view: null, alarmUntil: 0 };
+  var IMG_BUS = '/assets/img/bus-shg.webp';
+  function redAlerts(b) { return (b.alerts || []).filter(function (a) { return a.level === 'red'; }); }
 
   function api() { return '/api/live-fleet.php' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''); }
   function onRoad(b) { return b.pos && (b.status === 'live' || b.status === 'weak' || b.status === 'waiting' || b.status === 'offline'); }
@@ -204,7 +238,7 @@ body.idle .bar .ctl{opacity:0}
     stage.appendChild(root);
     var mapEl = document.createElement('div');
     root.querySelector('.fmap').insertBefore(mapEl, root.querySelector('.prog'));
-    var fm = new LF.FleetMap(mapEl, { style: LF.STYLE_DARK, controls: false, glideMs: 1000 });
+    var fm = new LF.FleetMap(mapEl, { look: 'night', controls: false, glideMs: 1000 });
     var current = null;
     fm.ready.then(function () { fm.map.setPitch(45); }).catch(function () {});
     return {
@@ -235,9 +269,12 @@ body.idle .bar .ctl{opacity:0}
         var n = list.indexOf(b) + 1;
         idx.hidden = list.length < 2; idx.textContent = n + ' / ' + list.length + (S.paused ? ' ⏸' : '');
         info.hidden = false;
-        info.innerHTML = '<div class="nm">' + esc(b.name) + '<small>' + esc(b.number) + (b.route ? ' · ' + esc(b.route.label) : '') + '</small></div>'
+        info.innerHTML = '<div class="top"><img class="bimg" src="' + IMG_BUS + '" alt="" onerror="this.remove()"><div class="nm">' + LF.plate(b.number, 'lg')
+          + '<small>' + esc(b.name) + (b.route ? ' · ' + esc(b.route.label) : '') + '</small></div></div>'
+          + LF.alertsHtml(b, false)
           + '<div class="row"><span class="speed">' + kmh(b) + ' <small>km/h</small></span>' + LF.pill(b.status, true)
-          + (b.battery != null ? '<span style="color:var(--mut)">🔋 ' + b.battery + '%</span>' : '') + '</div>'
+          + (b.battery != null ? '<span style="color:var(--mut)">🔋 ' + b.battery + '%' + (b.phone && b.phone.charging ? ' ⚡' : '') + '</span>' : '') + '</div>'
+          + '<div class="hl">' + LF.headline(b) + '</div>'
           + '<div class="stop np">' + stopLine(b) + '</div>'
           + '<div class="row" style="color:var(--mut);font-size:14px">' + (b.driver ? '👤 ' + esc(b.driver.name) + ' · ' : '') + 'GPS ' + esc(LF.ago(b.age_s))
           + (b.trip ? ' · ' + b.trip.km + ' km driven' : '') + '</div>';
@@ -262,7 +299,7 @@ body.idle .bar .ctl{opacity:0}
       },
       tick: function () {
         var bar = root.querySelector('.prog i'), list = shown();
-        if (S.paused || list.length < 2) { bar.style.width = '0'; return; }
+        if (S.paused || list.length < 2 || Date.now() < S.alarmUntil) { bar.style.width = '0'; return; }
         var k = (Date.now() - S.rotT0) / ROTATE;
         bar.style.width = Math.min(100, k * 100) + '%';
         if (k >= 1) step(1);
@@ -307,7 +344,7 @@ body.idle .bar .ctl{opacity:0}
             var m = document.createElement('div');
             el.insertBefore(m, el.firstChild);
             root.appendChild(el);
-            var fm = new LF.FleetMap(m, { style: LF.STYLE_DARK, controls: false, interactive: false, labels: false });
+            var fm = new LF.FleetMap(m, { look: 'night', controls: false, interactive: false, labels: false });
             t = tiles[b.id] = { el: el, fm: fm, placed: false };
             fm.ready.then(function () { fm.select(b.id); }).catch(function () {});
           }
@@ -336,7 +373,7 @@ body.idle .bar .ctl{opacity:0}
     stage.appendChild(root);
     var m = document.createElement('div');
     root.appendChild(m);
-    var fm = new LF.FleetMap(m, { style: LF.STYLE_DARK, controls: false });
+    var fm = new LF.FleetMap(m, { look: 'night', controls: false });
     var lastFit = 0;
     return {
       update: function () {
@@ -350,11 +387,50 @@ body.idle .bar .ctl{opacity:0}
     };
   }
 
+  /* 🚉 Like a station departure board: one row per vehicle number. Buses with
+     a red alert first, then the ones on the road by expected arrival, then
+     the rest. More rows than fit → pages that turn every 12 s. */
+  function boardView() {
+    var root = document.createElement('div');
+    root.className = 'board';
+    stage.appendChild(root);
+    var page = 0, pageT0 = Date.now(), pages = 1;
+    function rank(b) { return redAlerts(b).length ? 0 : onRoad(b) ? 1 : b.status === 'parked' ? 3 : 2; }
+    function eta(b) { return b.stop && b.stop.next_min != null ? b.stop.next_min : 1e9; }
+    function draw() {
+      var list = S.buses.slice().sort(function (a, b) { return rank(a) - rank(b) || eta(a) - eta(b) || (a.number < b.number ? -1 : 1); });
+      var per = Math.max(3, Math.floor((root.clientHeight - 70) / 52));
+      pages = Math.max(1, Math.ceil(list.length / per));
+      if (page >= pages) page = 0;
+      var rows = list.slice(page * per, page * per + per).map(function (b) {
+        var st = b.stop || {}, s = LF.STATUS[b.status] || LF.STATUS.idle, red = redAlerts(b);
+        var here = red.length ? red[0].icon + ' ' + red[0].ne : b.place ? (b.place.at ? '' : 'नजिक ') + b.place.name : st.near ? LF.nm(st.near_ne, st.near) : s.np;
+        var late = b.status === 'parked' ? '' : LF.neLate(b.delay);
+        return '<tr class="' + (red.length ? 'red' : '') + '"><td>' + LF.plate(b.number) + '<small>' + esc(b.name) + '</small></td>'
+          + '<td class="w">' + esc(b.route ? b.route.label : '—') + '<small>' + (b.driver ? '👤 ' + esc(b.driver.name) : '') + '</small></td>'
+          + '<td class="w">' + esc(here) + '<small>' + LF.pill(b.status, true) + '</small></td>'
+          + '<td>' + (st.next ? esc(LF.nm(st.next_ne, st.next)) + '<small>' + LF.neKm(st.next_km) + '</small>' : '—') + '</td>'
+          + '<td>' + (st.next_min != null && onRoad(b) ? LF.neClock(Date.now() + st.next_min * 60000) + '<small>' + LF.neDur(st.next_min) + '</small>' : '—') + '</td>'
+          + '<td>' + (late ? '<span class="chip" style="background:' + LF.lateColor(b.delay) + '">' + esc(late) + '</span>' : '—') + '</td>'
+          + '<td>' + (kmh(b) ? LF.ne(kmh(b)) + ' <small style="display:inline">किमी/घण्टा</small>' : '—') + '<small>' + esc(LF.ago(b.age_s)) + '</small></td></tr>';
+      }).join('');
+      root.innerHTML = '<table><colgroup><col style="width:15%"><col style="width:17%"><col style="width:19%"><col style="width:15%"><col style="width:14%"><col style="width:10%"><col style="width:10%"></colgroup>'
+        + '<thead><tr><th>गाडी नं. · Vehicle</th><th>रुट · Route</th><th>अहिले · Now</th><th>अर्को स्टप · Next</th><th>पुग्ने समय · ETA</th><th>स्थिति</th><th>गति · Speed</th></tr></thead>'
+        + '<tbody>' + (rows || '<tr><td colspan="7" class="none">कुनै गाडी छैन · No vehicles</td></tr>') + '</tbody></table>'
+        + (pages > 1 ? '<div class="pg">पेज ' + LF.ne(page + 1) + ' / ' + LF.ne(pages) + '</div>' : '');
+    }
+    return {
+      update: draw,
+      tick: function () { if (pages > 1 && Date.now() - pageT0 > 12000) { page = (page + 1) % pages; pageT0 = Date.now(); draw(); } },
+      destroy: function () {}
+    };
+  }
+
   function setLayout(l) {
     layout = l;
     destroyView();
-    S.view = l === 'grid' ? gridView() : l === 'all' ? allView() : focusView();
-    document.getElementById('tv').classList.toggle('no-ticker', l === 'grid');
+    S.view = l === 'grid' ? gridView() : l === 'all' ? allView() : l === 'board' ? boardView() : focusView();
+    document.getElementById('tv').classList.toggle('no-ticker', l === 'grid' || l === 'board');
     Array.prototype.forEach.call(document.querySelectorAll('[data-layout]'), function (b) { b.classList.toggle('on', b.dataset.layout === l); });
     try { var u = new URL(location.href); u.searchParams.set('layout', l); history.replaceState(null, '', u); } catch (e) {}
     if (S.buses.length) S.view.update();
@@ -375,8 +451,8 @@ body.idle .bar .ctl{opacity:0}
     var tk = document.getElementById('ticker');
     tk.innerHTML = S.buses.map(function (b) {
       var s = LF.STATUS[b.status] || LF.STATUS.idle, v = kmh(b);
-      return '<span class="tk' + (layout === 'focus' && b.id === S.focusId ? ' cur' : '') + '" data-id="' + b.id + '"><i style="background:' + s.c + '"></i>'
-        + esc(b.number || b.name) + ' <small>' + (v ? v + ' km/h' : esc(s.np)) + (b.place && b.status !== 'parked' ? ' · ' + esc(b.place.name) : '') + '</small></span>';
+      return '<span class="tk' + (layout === 'focus' && b.id === S.focusId ? ' cur' : '') + '" data-id="' + b.id + '"><i style="background:' + (redAlerts(b).length ? '#dc2626' : s.c) + '"></i>'
+        + LF.plate(b.number || b.name, 'sm') + ' <small>' + (v ? v + ' km/h' : esc(s.np)) + (b.place && b.status !== 'parked' ? ' · ' + esc(b.place.name) : '') + '</small></span>';
     }).join('');
   }
   document.getElementById('ticker').addEventListener('click', function (e) {
@@ -404,6 +480,7 @@ body.idle .bar .ctl{opacity:0}
     else if (e.key === '1') setLayout('focus');
     else if (e.key === '2') setLayout('grid');
     else if (e.key === '3') setLayout('all');
+    else if (e.key === '4') setLayout('board');
     else if (e.key === 'f' || e.key === 'F') document.getElementById('bFull').click();
   });
   var idleT = null;
@@ -424,15 +501,41 @@ body.idle .bar .ctl{opacity:0}
 
   setLayout(layout);
   if (LOCK) setPaused(true);
+  /* 🆘 A red banner on every layout while any bus has an SOS / breakdown /
+     overspeed alert; a tap opens that bus. */
+  var alarmEl = document.getElementById('alarm');
+  function renderAlarm() {
+    var rows = [];
+    S.buses.forEach(function (b) {
+      redAlerts(b).forEach(function (a) {
+        rows.push('<span data-id="' + b.id + '">' + esc(a.icon) + ' ' + LF.plate(b.number, 'sm') + ' ' + esc(a.ne) + (b.place ? ' — ' + esc(b.place.name) : '') + '</span>');
+      });
+    });
+    alarmEl.hidden = !rows.length;
+    document.body.classList.toggle('has-alarm', rows.length > 0);
+    var html = rows.join('<span style="opacity:.6">·</span>');
+    if (alarmEl._h !== html) { alarmEl.innerHTML = html; alarmEl._h = html; }
+  }
+  alarmEl.addEventListener('click', function (e) {
+    var t = e.target.closest('[data-id]'), b = t && byId(+t.dataset.id);
+    if (!b || !b.pos) return;
+    if (layout !== 'focus') setLayout('focus');
+    S.focusId = b.id; S.rotT0 = Date.now(); S.view.update(); renderTicker();
+  });
+
   /* 📢 Nepali announcements: a banner on screen, spoken after one tap on 🔊. */
   var tracker = new LF.Tracker(), annT = null;
-  var voice = new LF.Announcer(function (text, icon) {
+  var voice = new LF.Announcer(function (text, icon, level) {
     var el = stage.querySelector('.ann');
     if (!el) { el = document.createElement('div'); el.className = 'ann off'; stage.appendChild(el); }
     el.textContent = (icon || '📢') + ' ' + text;
+    el.style.background = level === 'alarm' ? '#b91c1c' : level === 'warn' ? 'linear-gradient(90deg,#b45309,#d97706)' : '';
     el.classList.remove('off');
     clearTimeout(annT);
     annT = setTimeout(function () { el.classList.add('off'); }, 20000);
+  }, function () {
+    // The browser refused to speak (no tap since the page loaded): ask for one.
+    bVoice.classList.remove('on'); bVoice.textContent = '🔇 आवाज'; vHint.hidden = false;
   });
   var bVoice = document.getElementById('bVoice'), vHint = document.getElementById('vHint');
   function setVoice(on) {
@@ -452,9 +555,16 @@ body.idle .bar .ctl{opacity:0}
     document.getElementById('nLive').textContent = d.counts.live;
     document.getElementById('nWeak').textContent = d.counts.weak;
     document.getElementById('nOff').textContent = d.counts.offline + d.counts.waiting;
+    tracker.limit = d.limit || tracker.limit;
+    var evs = tracker.events(d.buses);
+    evs.forEach(function (ev) {
+      // An SOS / breakdown: show that bus now and hold it for 2 minutes.
+      if (ev.level === 'alarm' && layout === 'focus' && byId(ev.busId) && byId(ev.busId).pos) { S.focusId = ev.busId; S.alarmUntil = Date.now() + 120000; }
+    });
     if (S.view) S.view.update();
     renderTicker();
-    tracker.events(d.buses).forEach(function (ev) { voice.say(ev.text, ev.icon); });
+    renderAlarm();
+    evs.forEach(function (ev) { voice.say(ev.text, ev.icon, ev.speak, ev.level); });
     if (d.need_cells && d.need_cells.length) LF.warmCells(d.need_cells, KEY);
   }, function (e) {
     if (e && (e.status === 401 || e.status === 403)) {

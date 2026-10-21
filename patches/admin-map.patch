@@ -1,0 +1,22 @@
+--- a/admin/map.php
++++ b/admin/map.php
+@@ -216,6 +216,11 @@
+   </aside>
+ </div>
+ 
++<?php /* Live Fleet (Oct 2026): every fleet bus on this map, in Google-like colours. */ if (is_file(INCLUDE_PATH . '/livefleet.php')) { require_once INCLUDE_PATH . '/livefleet.php'; ?>
++<link rel="stylesheet" href="<?= Security::e(LiveFleet::asset('livefleet.css')) ?>">
++<script src="<?= Security::e(LiveFleet::asset('livefleet.js')) ?>"></script>
++<script src="<?= Security::e(LiveFleet::asset('overlay.js')) ?>"></script>
++<?php } ?>
+ <script>
+ window.ADMAP = {
+   routes: <?= json_encode($jsRoutes, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>,
+@@ -308,6 +313,7 @@
+     map.on('load', function(){
+       var l = document.getElementById('lmLoad'); if (l) l.remove();
+       draw();
++      if (window.LiveFleetOverlay) window.LiveFleetOverlay(map);
+       var b = bounds(); if (b) map.fitBounds(b, { padding: 48, duration: 0 });
+       poll(); setInterval(poll, 15000);
+     });

@@ -21,6 +21,14 @@
  *  written (mirrorLegacy) while a single bus is live, so the passenger
  *  Trip Companion, api/eta.php and the "bus is near" alerts keep working.
  *
+ *  Phones: a driver phone signs in with Driver ID + PIN and drives any bus;
+ *  a vehicle phone is paired once to ONE vehicle number (one-time code /
+ *  QR from admin/live-setup.php) and tracks that bus with no PIN.
+ *
+ *  Like the railways' running status: fleet_stop_events keeps when a bus
+ *  really reached / left each stop beside the timetable time, so every
+ *  screen can show "on time" or "running 25 min late" stop by stop.
+ *
  *  CCTV: fleet_cameras holds any number of feeds per bus. The browser
  *  plays them directly (HLS / MJPEG / snapshot / vendor embed); see
  *  docs/CCTV.md for turning a bus DVR's RTSP feed into one of those.
@@ -209,7 +217,8 @@ final class LiveFleet
 
     /**
      * The signed-in phone behind a token, or null (unknown, revoked, idle
-     * too long, or the driver was switched off).
+     * too long, the driver switched off or lost their login, or — for a
+     * vehicle phone — its bus taken out of the fleet).
      *
      * @return array<string,mixed>|null
      */
@@ -219,14 +228,26 @@ final class LiveFleet
             return null;
         }
         $row = Database::fetch(
-            'SELECT v.*, d.full_name AS driver_name, d.phone AS driver_phone, d.is_active AS driver_active, l.login_code
+            'SELECT v.*, d.full_name AS driver_name, d.phone AS driver_phone, d.is_active AS driver_active, l.login_code,
+                    b.bus_number, b.bus_name, b.is_active AS bus_active
                FROM fleet_devices v
-               JOIN drivers d ON d.id = v.driver_id
-               JOIN fleet_driver_logins l ON l.driver_id = v.driver_id
+               LEFT JOIN drivers d ON d.id = v.driver_id
+               LEFT JOIN fleet_driver_logins l ON l.driver_id = v.driver_id
+               LEFT JOIN buses b ON b.id = v.bus_id
               WHERE v.token_hash = :h AND v.revoked_at IS NULL LIMIT 1',
             ['h' => hash('sha256', $token)]
         );
-        if ($row === null || (int) $row['driver_active'] !== 1) {
+        if ($row === null) {
+            return null;
+        }
+        if ($row['kind'] === 'vehicle') {
+            if ($row['bus_id'] === null || (int) $row['bus_active'] !== 1) {
+                return null;
+            }
+            // The name the office sees: whoever is assigned to this vehicle.
+            $drv = self::driverForBus((int) $row['bus_id']);
+            $row['driver_name'] = $drv['full_name'] ?? ('Bus phone ' . $row['bus_number']);
+        } elseif ((int) $row['driver_active'] !== 1 || $row['login_code'] === null) {
             return null;
         }
         $seen = strtotime((string) ($row['last_seen_at'] ?? $row['created_at']));
@@ -309,14 +330,17 @@ final class LiveFleet
      */
     public static function busesFor(array $device): array
     {
-        $driverId = (int) $device['driver_id'];
+        $driverId = (int) ($device['driver_id'] ?? 0);
         $sched = Database::fetch(
             "SELECT bus_id FROM schedules
               WHERE driver_id = :d AND bus_id IS NOT NULL AND status <> 'cancelled' AND travel_date IN (:t, :y)
               ORDER BY travel_date DESC LIMIT 1",
             ['d' => $driverId, 't' => date('Y-m-d'), 'y' => date('Y-m-d', time() - 86400)]
         );
-        $suggest = $sched !== null ? (int) $sched['bus_id'] : (int) ($device['bus_id'] ?? 0);
+        // Today's timetable first, then the vehicle the office assigned to this driver, then the last bus driven.
+        $assigned = (int) Database::scalar('SELECT bus_id FROM fleet_vehicle_assign WHERE driver_id = :d ORDER BY updated_at DESC LIMIT 1', ['d' => $driverId], 0);
+        $suggest = $sched !== null ? (int) $sched['bus_id'] : ($assigned > 0 ? $assigned : (int) ($device['bus_id'] ?? 0));
+        $onlyBus = ($device['kind'] ?? 'driver') === 'vehicle' ? (int) $device['bus_id'] : 0;
 
         $out = [];
         foreach (Database::fetchAll(
@@ -326,11 +350,15 @@ final class LiveFleet
                LEFT JOIN drivers d ON d.id = t.driver_id
               WHERE b.is_active = 1 ORDER BY b.id"
         ) as $b) {
+            if ($onlyBus > 0 && (int) $b['id'] !== $onlyBus) {
+                continue;
+            }
             $busy = $b['busy_driver'] !== null && (int) $b['busy_driver'] !== $driverId;
             $out[(int) $b['id']] = [
                 'id' => (int) $b['id'], 'number' => (string) $b['bus_number'], 'name' => (string) $b['bus_name'],
-                'suggested' => (int) $b['id'] === $suggest,
-                'busy' => $busy ? (string) ($b['busy_name'] ?? 'another driver') : null,
+                'suggested' => $onlyBus > 0 || (int) $b['id'] === $suggest,
+                'assigned' => $onlyBus > 0 || (int) $b['id'] === $assigned,
+                'busy' => $busy && $onlyBus === 0 ? (string) ($b['busy_name'] ?? 'another driver') : null,
             ];
         }
         return array_values($out);
@@ -344,18 +372,23 @@ final class LiveFleet
      */
     public static function startTrip(array $device, int $busId): array
     {
+        $vehicle = ($device['kind'] ?? 'driver') === 'vehicle';
+        if ($vehicle) {
+            $busId = (int) $device['bus_id'];       // a vehicle phone only ever tracks its own bus
+        }
         $bus = Database::fetch('SELECT id, bus_number, bus_name FROM buses WHERE id = :id AND is_active = 1', ['id' => $busId]);
         if ($bus === null) {
             throw new RuntimeException('That bus is not in the active fleet.');
         }
-        $driverId = (int) $device['driver_id'];
+        $driverId = $vehicle ? (int) (self::driverForBus($busId)['id'] ?? 0) : (int) $device['driver_id'];
         $now = date('Y-m-d H:i:s');
 
         foreach (Database::fetchAll(
-            "SELECT id, bus_id, driver_id, device_id FROM fleet_trips WHERE status = 'running' AND (bus_id = :b OR driver_id = :d OR device_id = :v)",
-            ['b' => $busId, 'd' => $driverId, 'v' => (int) $device['id']]
+            "SELECT id, bus_id, driver_id, device_id FROM fleet_trips
+              WHERE status = 'running' AND (bus_id = :b OR device_id = :v OR (:d > 0 AND driver_id = :d2 AND :veh = 0))",
+            ['b' => $busId, 'v' => (int) $device['id'], 'd' => $driverId, 'd2' => $driverId, 'veh' => $vehicle ? 1 : 0]
         ) as $old) {
-            Database::update('fleet_trips', ['status' => 'ended', 'ended_at' => $now, 'end_reason' => (int) $old['bus_id'] === $busId && (int) $old['driver_id'] !== $driverId ? 'taken_over' : 'restarted'],
+            Database::update('fleet_trips', ['status' => 'ended', 'ended_at' => $now, 'end_reason' => (int) $old['bus_id'] === $busId && (int) $old['device_id'] !== (int) $device['id'] ? 'taken_over' : 'restarted'],
                 'id = :id', ['id' => (int) $old['id']]);
         }
 
@@ -372,10 +405,12 @@ final class LiveFleet
         );
 
         $id = Database::insert('fleet_trips', [
-            'bus_id' => $busId, 'driver_id' => $driverId, 'device_id' => (int) $device['id'],
+            'bus_id' => $busId, 'driver_id' => $driverId > 0 ? $driverId : null, 'device_id' => (int) $device['id'],
             'schedule_id' => $sched !== null ? (int) $sched['id'] : null,
             'route_id' => $routeId > 0 ? $routeId : null,
             'status' => 'running', 'started_at' => $now,
+            // The passenger live link (bus-live.php?t=…): unguessable, dies with the trip.
+            'share_token' => bin2hex(random_bytes(12)),
         ]);
         Database::update('fleet_devices', ['bus_id' => $busId], 'id = :id', ['id' => (int) $device['id']]);
         Logger::audit('fleet.trip.start', 'bus', (string) $busId, null, ['trip' => $id, 'driver' => $driverId]);
@@ -404,14 +439,18 @@ final class LiveFleet
      * Take a batch of GPS fixes from the phone.
      *
      * Each point: lat, lng, and optionally ts (ms since epoch, phone clock),
-     * spd (m/s, as the Geolocation API reports), hdg (degrees), acc (m).
-     * Bad points are dropped, not fatal: a phone that just regained signal
-     * must never lose a whole batch to one nonsense fix.
+     * spd (m/s, as the Geolocation API reports), hdg (degrees), acc (m),
+     * alt (m). Bad points are dropped, not fatal: a phone that just regained
+     * signal must never lose a whole batch to one nonsense fix.
+     *
+     * $meta: what else the phone knows — charging (bool), net ('4g', 'wifi'…),
+     * visible (bool: the driver page is on screen).
      *
      * @param list<array<string,mixed>> $points
+     * @param array<string,mixed> $meta
      * @return array{accepted:int, dropped:int, trip_id:int, distance_km:float}
      */
-    public static function ping(array $device, array $points, ?int $battery = null, ?int $nowTs = null): array
+    public static function ping(array $device, array $points, ?int $battery = null, ?int $nowTs = null, array $meta = []): array
     {
         $trip = self::currentTrip($device);
         if ($trip === null) {
@@ -431,12 +470,13 @@ final class LiveFleet
         $clean   = array_values($clean);
         $dropped = count($points) - count($clean);
 
+        $phone = self::phoneMeta($battery, $meta);
         if ($clean === []) {
             // last_ping_at is "when the server last learned where the bus is" — the
             // whole live / weak / offline colour hangs on it — so a batch with no
-            // new fix leaves it alone and only the battery is noted.
-            if ($battery !== null) {
-                Database::update('fleet_trips', ['last_battery' => max(0, min(100, $battery))], 'id = :id', ['id' => (int) $trip['id']]);
+            // new fix leaves it alone and only the phone's state is noted.
+            if ($phone !== []) {
+                Database::update('fleet_trips', $phone, 'id = :id', ['id' => (int) $trip['id']]);
             }
             return ['accepted' => 0, 'dropped' => $dropped, 'trip_id' => (int) $trip['id'], 'distance_km' => (float) $trip['distance_km']];
         }
@@ -456,7 +496,9 @@ final class LiveFleet
                 if ($pt['kmh'] === null && $kmh !== null && $pt['acc'] <= self::GOOD_ACCURACY_M && $kmh <= self::MAX_SPEED_KMH) {
                     $clean[$i]['kmh'] = $pt['kmh'] = round($kmh, 1);
                 }
-                if ($pt['acc'] <= self::GOOD_ACCURACY_M && $prev['acc'] <= self::GOOD_ACCURACY_M && $kmh !== null && $kmh <= self::MAX_SPEED_KMH) {
+                // Standing still, GPS wanders a few metres: that is not distance driven.
+                $parked = $km < 0.025 && ($pt['kmh'] ?? 0.0) < 3;
+                if (!$parked && $pt['acc'] <= self::GOOD_ACCURACY_M && $prev['acc'] <= self::GOOD_ACCURACY_M && $kmh !== null && $kmh <= self::MAX_SPEED_KMH) {
                     $addKm += $km;
                 }
             }
@@ -473,8 +515,21 @@ final class LiveFleet
             $prev = $pt;
         }
         $last = end($clean);
+        // The overspeed / standing-still clocks run fix by fix, so a batch sent
+        // after a network gap starts them at the first fix that shows it. The
+        // office alerts and stop arrivals are checked at every kept trail point
+        // and the last fix: a stop passed while offline is still recorded.
+        $state = ['stopped_since' => $trip['stopped_since'] ?? null, 'overspeed_since' => $trip['overspeed_since'] ?? null];
+        $inTrail = array_flip(array_map(static fn(array $p): int => $p['ts'], $trail));
+        $marks = [];
+        foreach ($clean as $n => $pt) {
+            $state = self::motionState($state, $pt, intdiv($pt['ts'], 1000));
+            if (isset($inTrail[$pt['ts']]) || $n === count($clean) - 1) {
+                $marks[] = [$pt, $state];
+            }
+        }
 
-        Database::transaction(static function () use ($trip, $trail, $last, $addKm, $clean, $battery, $nowTs, $lastTrail, $avg): void {
+        Database::transaction(static function () use ($trip, $trail, $last, $addKm, $clean, $nowTs, $lastTrail, $avg, $phone, $state): void {
             if ($trail !== []) {
                 $rows = [];
                 $args = [];
@@ -485,16 +540,32 @@ final class LiveFleet
                 }
                 Database::query('INSERT INTO fleet_points (trip_id, lat, lng, speed_kmh, heading, accuracy_m, recorded_at) VALUES ' . implode(',', $rows), $args);
             }
-            Database::query(
-                'UPDATE fleet_trips SET last_lat = :la, last_lng = :ln, last_speed_kmh = :s, avg_speed_kmh = :avg, last_heading = :h, last_accuracy_m = :a,
-                        last_fix_at = :f, last_ping_at = :p, last_trail_at = :lt, distance_km = distance_km + :km, points = points + :n'
-                . ($battery !== null ? ', last_battery = :bat' : '') . ' WHERE id = :id',
-                ['la' => $last['lat'], 'ln' => $last['lng'], 's' => $last['kmh'], 'avg' => $avg !== null ? round($avg, 1) : null, 'h' => $last['hdg'], 'a' => $last['acc'],
-                 'f' => date('Y-m-d H:i:s', intdiv($last['ts'], 1000)), 'p' => date('Y-m-d H:i:s', $nowTs),
-                 'lt' => $lastTrail > 0 ? date('Y-m-d H:i:s', $lastTrail) : null, 'km' => round($addKm, 3), 'n' => count($clean), 'id' => (int) $trip['id']]
-                + ($battery !== null ? ['bat' => max(0, min(100, $battery))] : [])
-            );
+            $top = max((float) ($trip['max_speed_kmh'] ?? 0), ...array_map(static fn(array $p): float => (float) ($p['kmh'] ?? 0), $clean));
+            Database::update('fleet_trips', [
+                'last_lat' => $last['lat'], 'last_lng' => $last['lng'], 'last_speed_kmh' => $last['kmh'],
+                'avg_speed_kmh' => $avg !== null ? round($avg, 1) : null, 'max_speed_kmh' => $top > 0 ? round(min($top, self::MAX_SPEED_KMH), 1) : null,
+                'last_heading' => $last['hdg'], 'last_accuracy_m' => $last['acc'], 'last_alt_m' => $last['alt'],
+                'last_fix_at' => date('Y-m-d H:i:s', intdiv($last['ts'], 1000)), 'last_ping_at' => date('Y-m-d H:i:s', $nowTs),
+                'last_trail_at' => $lastTrail > 0 ? date('Y-m-d H:i:s', $lastTrail) : null,
+                'stopped_since' => $state['stopped_since'], 'overspeed_since' => $state['overspeed_since'],
+            ] + $phone, 'id = :id', ['id' => (int) $trip['id']]);
+            Database::query('UPDATE fleet_trips SET distance_km = distance_km + :km, points = points + :n WHERE id = :id',
+                ['km' => round($addKm, 3), 'n' => count($clean), 'id' => (int) $trip['id']]);
         });
+
+        // Office alerts and the stop-by-stop running status. Best effort: a
+        // hiccup here must never cost the phone its accepted fixes.
+        try {
+            foreach ($marks as [$pt, $st]) {
+                $at = intdiv($pt['ts'], 1000);
+                self::recordAlerts($trip, $pt, $at, $st);
+                if ($trip['route_id'] !== null) {
+                    self::recordStopEvents($trip, $pt, $at);
+                }
+            }
+        } catch (Throwable $e) {
+            Logger::warning('fleet events failed', ['trip' => (int) $trip['id'], 'err' => $e->getMessage()]);
+        }
 
         $prevPing = $trip['last_ping_at'] !== null ? (int) strtotime((string) $trip['last_ping_at']) : 0;
         if (intdiv($nowTs, self::MIRROR_SECONDS) !== intdiv($prevPing, self::MIRROR_SECONDS)) {
@@ -506,9 +577,284 @@ final class LiveFleet
     }
 
     /**
+     * What the phone says about itself → fleet_trips columns.
+     *
+     * @param array<string,mixed> $meta
+     * @return array<string,mixed>
+     */
+    private static function phoneMeta(?int $battery, array $meta): array
+    {
+        $out = [];
+        if ($battery !== null) {
+            $out['last_battery'] = max(0, min(100, $battery));
+        }
+        if (array_key_exists('charging', $meta) && $meta['charging'] !== null) {
+            $out['last_charging'] = !empty($meta['charging']) ? 1 : 0;
+        }
+        if (isset($meta['net']) && is_string($meta['net'])) {
+            $net = strtolower(substr((string) preg_replace('/[^a-z0-9-]/i', '', $meta['net']), 0, 12));
+            if ($net !== '') {
+                $out['last_net'] = $net;
+            }
+        }
+        if (array_key_exists('visible', $meta) && $meta['visible'] !== null) {
+            $out['last_visible'] = !empty($meta['visible']) ? 1 : 0;
+        }
+        return $out;
+    }
+
+    /**
+     * Standing still since when, over the limit since when — carried on the
+     * trip so an alert can say "stopped 25 min" without reading history.
+     *
+     * @param array{stopped_since?:?string, overspeed_since?:?string} $was the clocks before this fix
+     * @return array{stopped_since:?string, overspeed_since:?string, limit:int}
+     */
+    private static function motionState(array $was, array $last, int $fixAt): array
+    {
+        $limit = max(30, Settings::getInt('fleet_speed_limit', 80));
+        $kmh = $last['kmh'];
+        $stopped = $was['stopped_since'] ?? null;
+        $over = $was['overspeed_since'] ?? null;
+        if ($kmh !== null) {
+            $stopped = $kmh < 3 ? ($stopped ?? date('Y-m-d H:i:s', $fixAt)) : null;
+            $over = $kmh > $limit ? ($over ?? date('Y-m-d H:i:s', $fixAt)) : null;
+        }
+        return ['stopped_since' => $stopped, 'overspeed_since' => $over, 'limit' => $limit];
+    }
+
+    /**
+     * Open / update / close the overspeed and long-stop episodes of a trip.
+     * Overspeed counts after 15 s above the limit (one bump on a downhill
+     * is not an episode); a stop counts after fleet_stop_alert_min minutes.
+     */
+    private static function recordAlerts(array $trip, array $last, int $fixAt, array $state): void
+    {
+        $tripId = (int) $trip['id'];
+        $open = [];
+        foreach (Database::fetchAll('SELECT id, kind, peak FROM fleet_alerts WHERE trip_id = :t AND ended_at IS NULL', ['t' => $tripId]) as $a) {
+            $open[(string) $a['kind']] = $a;
+        }
+        $at = date('Y-m-d H:i:s', $fixAt);
+        $overFor = $state['overspeed_since'] !== null ? $fixAt - (int) strtotime((string) $state['overspeed_since']) : -1;
+        if ($overFor >= 15) {
+            if (!isset($open['overspeed'])) {
+                Database::insert('fleet_alerts', ['trip_id' => $tripId, 'bus_id' => (int) $trip['bus_id'], 'kind' => 'overspeed',
+                    'started_at' => (string) $state['overspeed_since'], 'peak' => $last['kmh'], 'lat' => $last['lat'], 'lng' => $last['lng']]);
+            } elseif ((float) $last['kmh'] > (float) $open['overspeed']['peak']) {
+                Database::update('fleet_alerts', ['peak' => $last['kmh']], 'id = :id', ['id' => (int) $open['overspeed']['id']]);
+            }
+        } elseif ($state['overspeed_since'] === null && isset($open['overspeed'])) {
+            Database::update('fleet_alerts', ['ended_at' => $at], 'id = :id', ['id' => (int) $open['overspeed']['id']]);
+        }
+
+        $stopMin = $state['stopped_since'] !== null ? intdiv($fixAt - (int) strtotime((string) $state['stopped_since']), 60) : -1;
+        if ($stopMin >= max(1, Settings::getInt('fleet_stop_alert_min', 20))) {
+            if (!isset($open['stopped'])) {
+                Database::insert('fleet_alerts', ['trip_id' => $tripId, 'bus_id' => (int) $trip['bus_id'], 'kind' => 'stopped',
+                    'started_at' => (string) $state['stopped_since'], 'peak' => $stopMin, 'lat' => $last['lat'], 'lng' => $last['lng']]);
+            } else {
+                Database::update('fleet_alerts', ['peak' => $stopMin], 'id = :id', ['id' => (int) $open['stopped']['id']]);
+            }
+        } elseif ($state['stopped_since'] === null && isset($open['stopped'])) {
+            Database::update('fleet_alerts', ['ended_at' => $at], 'id = :id', ['id' => (int) $open['stopped']['id']]);
+        }
+
+        // A puncture, police check or meal halt is over once the bus is rolling again.
+        if ((float) ($last['kmh'] ?? 0) > 15) {
+            foreach (['puncture', 'police', 'meal'] as $k) {
+                if (isset($open[$k])) {
+                    Database::update('fleet_alerts', ['ended_at' => $at], 'id = :id', ['id' => (int) $open[$k]['id']]);
+                }
+            }
+        }
+    }
+
+    /**
+     * The running status, stop by stop: the first fix within 1 km of a
+     * stop is its arrival; the first fix more than 1.5 km away after that
+     * is its departure. Written as the fixes come in, so it is right even
+     * when no screen is open.
+     */
+    private static function recordStopEvents(array $trip, array $last, int $fixAt): void
+    {
+        $tripId = (int) $trip['id'];
+        $stops = self::routeStops((int) $trip['route_id']);
+        if ($stops === []) {
+            return;
+        }
+        $at = date('Y-m-d H:i:s', $fixAt);
+        $sched = null;
+        foreach ($stops as $i => $st) {
+            $km = self::haversineKm($last['lat'], $last['lng'], $st['lat'], $st['lng']);
+            if ($km <= 1.0) {
+                $sched ??= self::schedTimes($trip);
+                Database::query(
+                    'INSERT INTO fleet_stop_events (trip_id, stop_idx, stop_name, sched_at, arrived_at) VALUES (:t, :i, :n, :s, :a)
+                     ON DUPLICATE KEY UPDATE arrived_at = COALESCE(arrived_at, VALUES(arrived_at))',
+                    ['t' => $tripId, 'i' => $i, 'n' => substr($st['name'], 0, 191), 's' => $sched[$i] ?? null, 'a' => $at]
+                );
+            }
+        }
+        foreach (Database::fetchAll(
+            'SELECT id, stop_idx FROM fleet_stop_events WHERE trip_id = :t AND arrived_at IS NOT NULL AND departed_at IS NULL', ['t' => $tripId]
+        ) as $ev) {
+            $st = $stops[(int) $ev['stop_idx']] ?? null;
+            if ($st !== null && self::haversineKm($last['lat'], $last['lng'], $st['lat'], $st['lng']) > 1.5) {
+                Database::update('fleet_stop_events', ['departed_at' => $at], 'id = :id', ['id' => (int) $ev['id']]);
+            }
+        }
+    }
+
+    /**
+     * Timetable time of every stop of a trip's route (index → 'Y-m-d H:i:s'),
+     * from route_stops.stop_time on the trip's travel date. A time earlier
+     * than the stop before it is the next day — an overnight run.
+     *
+     * @return array<int,string>
+     */
+    public static function schedTimes(array $trip): array
+    {
+        if (empty($trip['route_id'])) {
+            return [];
+        }
+        $date = null;
+        if (!empty($trip['schedule_id'])) {
+            $date = Database::scalar('SELECT travel_date FROM schedules WHERE id = :id', ['id' => (int) $trip['schedule_id']]);
+        }
+        $date = is_string($date) && $date !== '' ? $date : date('Y-m-d', (int) strtotime((string) $trip['started_at']));
+        $out = [];
+        $day = 0;
+        $prev = null;
+        foreach (self::routeStops((int) $trip['route_id']) as $i => $st) {
+            if ($st['time'] === null) {
+                continue;
+            }
+            $sec = (int) strtotime('1970-01-01 ' . $st['time'] . ' UTC');
+            if ($prev !== null && $sec < $prev) {
+                $day++;
+            }
+            $prev = $sec;
+            $out[$i] = date('Y-m-d H:i:s', (int) strtotime($date . ' ' . $st['time'] . ' +' . $day . ' day'));
+        }
+        return $out;
+    }
+
+    /* =================================================================
+     *  Vehicle numbers: regular driver per vehicle, and vehicle phones
+     * ================================================================= */
+
+    /**
+     * Who drives this vehicle: the driver the office assigned to it, else
+     * today's (or last night's) timetable driver. Null when nobody is set.
+     *
+     * @return array{id:int, full_name:string, phone:string}|null
+     */
+    public static function driverForBus(int $busId): ?array
+    {
+        $row = Database::fetch(
+            'SELECT d.id, d.full_name, d.phone FROM fleet_vehicle_assign a JOIN drivers d ON d.id = a.driver_id
+              WHERE a.bus_id = :b AND d.is_active = 1',
+            ['b' => $busId]
+        ) ?? Database::fetch(
+            "SELECT d.id, d.full_name, d.phone FROM schedules s JOIN drivers d ON d.id = s.driver_id
+              WHERE s.bus_id = :b AND s.status <> 'cancelled' AND s.travel_date IN (:t, :y) AND d.is_active = 1
+              ORDER BY s.travel_date DESC LIMIT 1",
+            ['b' => $busId, 't' => date('Y-m-d'), 'y' => date('Y-m-d', time() - 86400)]
+        );
+        return $row === null ? null : ['id' => (int) $row['id'], 'full_name' => (string) $row['full_name'], 'phone' => (string) ($row['phone'] ?? '')];
+    }
+
+    /** Give a vehicle number its regular driver (null clears it). */
+    public static function assignDriver(int $busId, ?int $driverId, int $by = 0): void
+    {
+        if (!Database::exists('SELECT 1 FROM buses WHERE id = :id', ['id' => $busId])) {
+            throw new RuntimeException('Bus not found.');
+        }
+        if ($driverId !== null && !Database::exists('SELECT 1 FROM drivers WHERE id = :id', ['id' => $driverId])) {
+            throw new RuntimeException('Driver not found.');
+        }
+        Database::query(
+            'INSERT INTO fleet_vehicle_assign (bus_id, driver_id, updated_at) VALUES (:b, :d, :u)
+             ON DUPLICATE KEY UPDATE driver_id = VALUES(driver_id), updated_at = VALUES(updated_at)',
+            ['b' => $busId, 'd' => $driverId, 'u' => date('Y-m-d H:i:s')]
+        );
+        Logger::audit('fleet.vehicle.assign', 'bus', (string) $busId, null, ['driver' => $driverId, 'by' => $by]);
+    }
+
+    /**
+     * A one-time code (6 digits, 15 minutes) that pairs a phone to this
+     * vehicle number. Older unused codes of the bus stop working.
+     *
+     * @return array{code:string, expires:int}
+     */
+    public static function createPairCode(int $busId, int $by = 0): array
+    {
+        if (!Database::exists('SELECT 1 FROM buses WHERE id = :id AND is_active = 1', ['id' => $busId])) {
+            throw new RuntimeException('That bus is not in the active fleet.');
+        }
+        Database::delete('fleet_pair_codes', 'bus_id = :b AND used_at IS NULL', ['b' => $busId]);
+        Database::delete('fleet_pair_codes', 'expires_at < :old', ['old' => date('Y-m-d H:i:s', time() - 86400)]);
+        $expires = time() + 15 * 60;
+        for ($try = 0; $try < 5; $try++) {
+            $code = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+            try {
+                Database::insert('fleet_pair_codes', ['bus_id' => $busId, 'code_hash' => hash('sha256', $code), 'expires_at' => date('Y-m-d H:i:s', $expires),
+                    'created_by' => $by > 0 ? $by : null, 'created_at' => date('Y-m-d H:i:s')]);
+                Logger::audit('fleet.vehicle.paircode', 'bus', (string) $busId, null, ['by' => $by]);
+                return ['code' => $code, 'expires' => $expires * 1000];
+            } catch (PDOException $e) {
+                // the same six digits are live for another bus right now — draw again
+            }
+        }
+        throw new RuntimeException('Could not make a pairing code — try again.');
+    }
+
+    /**
+     * Phone side of pairing: a valid code turns this phone into the
+     * vehicle phone of that bus. The bus's previous vehicle phone is signed
+     * out — one vehicle, one tracker.
+     *
+     * @return array{ok:bool, error?:string, token?:string, bus?:array<string,mixed>}
+     */
+    public static function pairVehicle(string $code, string $userAgent = '', string $ip = ''): array
+    {
+        $code = (string) preg_replace('/\D/', '', $code);
+        $bad  = ['ok' => false, 'error' => 'That code is wrong or expired. Ask the office for a new one. · कोड मिलेन, नयाँ कोड लिनुहोस्।'];
+        if (strlen($code) !== 6) {
+            return $bad;
+        }
+        $row = Database::fetch(
+            'SELECT c.id, c.bus_id, b.bus_number, b.bus_name FROM fleet_pair_codes c JOIN buses b ON b.id = c.bus_id
+              WHERE c.code_hash = :h AND c.used_at IS NULL AND c.expires_at > :now AND b.is_active = 1 LIMIT 1',
+            ['h' => hash('sha256', $code), 'now' => date('Y-m-d H:i:s')]
+        );
+        if ($row === null) {
+            return $bad;
+        }
+        // Use it up first, so the same code can never pair two phones.
+        if (Database::update('fleet_pair_codes', ['used_at' => date('Y-m-d H:i:s')], 'id = :id AND used_at IS NULL', ['id' => (int) $row['id']]) !== 1) {
+            return $bad;
+        }
+        $busId = (int) $row['bus_id'];
+        foreach (Database::fetchAll("SELECT * FROM fleet_devices WHERE bus_id = :b AND kind = 'vehicle' AND revoked_at IS NULL", ['b' => $busId]) as $old) {
+            self::endTrip($old, 'replaced');
+        }
+        Database::update('fleet_devices', ['revoked_at' => date('Y-m-d H:i:s')], "bus_id = :b AND kind = 'vehicle' AND revoked_at IS NULL", ['b' => $busId]);
+        $token = bin2hex(random_bytes(32));
+        $now = date('Y-m-d H:i:s');
+        Database::insert('fleet_devices', [
+            'kind' => 'vehicle', 'driver_id' => null, 'token_hash' => hash('sha256', $token), 'label' => self::deviceLabel($userAgent),
+            'bus_id' => $busId, 'last_ip' => $ip !== '' ? substr($ip, 0, 45) : null, 'created_at' => $now, 'last_seen_at' => $now,
+        ]);
+        Logger::audit('fleet.vehicle.paired', 'bus', (string) $busId, null, ['ip' => $ip]);
+        return ['ok' => true, 'token' => $token, 'bus' => ['id' => $busId, 'number' => (string) $row['bus_number'], 'name' => (string) $row['bus_name']]];
+    }
+
+    /**
      * One raw point → a clean one, or null when it cannot be a real fix.
      *
-     * @return array{lat:float,lng:float,ts:int,kmh:?float,hdg:?int,acc:float}|null
+     * @return array{lat:float,lng:float,ts:int,kmh:?float,hdg:?int,acc:float,alt:?float}|null
      */
     public static function cleanPoint(mixed $p, int $nowTs): ?array
     {
@@ -534,8 +880,9 @@ final class LiveFleet
             $kmh = round(min((float) $p['spd'] * 3.6, 250.0), 1);
         }
         $hdg = is_numeric($p['hdg'] ?? null) && (float) $p['hdg'] >= 0 ? ((int) round((float) $p['hdg'])) % 360 : null;
+        $alt = is_numeric($p['alt'] ?? null) && abs((float) $p['alt']) < 9000 ? round((float) $p['alt'], 1) : null;
 
-        return ['lat' => round($lat, 7), 'lng' => round($lng, 7), 'ts' => $ts, 'kmh' => $kmh, 'hdg' => $hdg, 'acc' => round($acc, 1)];
+        return ['lat' => round($lat, 7), 'lng' => round($lng, 7), 'ts' => $ts, 'kmh' => $kmh, 'hdg' => $hdg, 'acc' => round($acc, 1), 'alt' => $alt];
     }
 
     /**
@@ -590,35 +937,47 @@ final class LiveFleet
         return $ageSeconds <= self::LIVE_SECONDS ? 'live' : ($ageSeconds <= self::WEAK_SECONDS ? 'weak' : 'offline');
     }
 
+    /** The columns every live view reads, for one bus and its latest trip. */
+    private const ROW_SELECT = "SELECT b.id AS bus_id, b.bus_number, b.bus_name,
+                    t.id AS trip_id, t.status AS trip_status, t.started_at, t.ended_at, t.route_id, t.schedule_id, t.share_token,
+                    t.last_lat, t.last_lng, t.last_speed_kmh, t.avg_speed_kmh, t.max_speed_kmh, t.last_heading, t.last_accuracy_m,
+                    t.last_alt_m, t.last_battery, t.last_charging, t.last_net, t.last_visible, t.stopped_since, t.overspeed_since,
+                    t.last_fix_at, t.last_ping_at, t.distance_km, dv.kind AS device_kind,
+                    d.full_name AS driver_name, d.phone AS driver_phone,
+                    r.route_code, r.from_city, r.to_city";
+
+    /** Things a driver can report from the phone with one tap. */
+    public const DRIVER_EVENTS = [
+        'sos'       => ['🆘', 'आपतकालीन — मद्दत चाहियो', 'Emergency — help needed'],
+        'breakdown' => ['🛠️', 'बस बिग्रियो', 'Breakdown'],
+        'puncture'  => ['🛞', 'टायर पंक्चर', 'Tyre puncture'],
+        'police'    => ['🚓', 'प्रहरी जाँच', 'Police check'],
+        'meal'      => ['🍛', 'खानाको लागि रोकियो', 'Meal halt'],
+    ];
+
     /**
      * Every active bus with its running trip — or, when parked, where its
-     * last trip ended. One query; the 1-second refresh depends on it.
+     * last trip ended. The 1-second refresh of every screen reads this.
      *
-     * @return array{now:int, buses:list<array<string,mixed>>, counts:array<string,int>, need_cells:list<string>}
+     * @return array{now:int, buses:list<array<string,mixed>>, counts:array<string,int>, need_cells:list<string>, limit:int}
      */
     public static function snapshot(bool $withCameras = true, ?int $nowTs = null): array
     {
         $nowTs = $nowTs ?? time();
         $rows = Database::fetchAll(
-            "SELECT b.id AS bus_id, b.bus_number, b.bus_name,
-                    t.id AS trip_id, t.status AS trip_status, t.started_at, t.ended_at, t.route_id,
-                    t.last_lat, t.last_lng, t.last_speed_kmh, t.avg_speed_kmh, t.last_heading, t.last_accuracy_m, t.last_battery,
-                    t.last_fix_at, t.last_ping_at, t.distance_km,
-                    d.full_name AS driver_name, d.phone AS driver_phone,
-                    r.route_code, r.from_city, r.to_city
+            self::ROW_SELECT . "
                FROM buses b
                LEFT JOIN fleet_trips t ON t.id = (
                     SELECT t2.id FROM fleet_trips t2 WHERE t2.bus_id = b.id
                      ORDER BY (t2.status = 'running') DESC, t2.id DESC LIMIT 1)
+               LEFT JOIN fleet_devices dv ON dv.id = t.device_id
                LEFT JOIN drivers d ON d.id = t.driver_id
                LEFT JOIN routes r ON r.id = t.route_id
               WHERE b.is_active = 1
               ORDER BY b.id"
         );
         $cams   = $withCameras ? self::camerasByBus(true) : [];
-        $counts = ['live' => 0, 'weak' => 0, 'offline' => 0, 'waiting' => 0, 'parked' => 0, 'idle' => 0];
-        $buses  = [];
-        $need   = [];
+        $alerts = self::openAlerts(array_values(array_filter(array_map(static fn(array $r): int => $r['trip_status'] === 'running' ? (int) $r['trip_id'] : 0, $rows))), $nowTs);
         // Load every cache square the on-road buses need in one query.
         $sq = [];
         foreach ($rows as $r) {
@@ -633,59 +992,279 @@ final class LiveFleet
         if ($sq !== []) {
             self::cells($sq);
         }
+        $counts = ['live' => 0, 'weak' => 0, 'offline' => 0, 'waiting' => 0, 'parked' => 0, 'idle' => 0];
+        $buses  = [];
+        $need   = [];
         foreach ($rows as $r) {
-            $ping   = $r['last_ping_at'] !== null ? (int) strtotime((string) $r['last_ping_at']) : null;
-            $age    = $ping !== null ? max(0, $nowTs - $ping) : null;
-            $status = self::statusOf($r['trip_status'] !== null ? (string) $r['trip_status'] : null, $age);
-            $counts[$status]++;
-            $hasPos = $r['last_lat'] !== null;
-            $kmh    = $r['last_speed_kmh'] !== null ? (float) $r['last_speed_kmh'] : null;
-            $avg    = $r['avg_speed_kmh'] !== null ? (float) $r['avg_speed_kmh'] : null;
-            $onRoad = $hasPos && $status !== 'parked';
-            $stop   = $onRoad && $r['route_id'] !== null
-                ? self::stopInfo((int) $r['route_id'], (float) $r['last_lat'], (float) $r['last_lng'], $avg ?? $kmh) : null;
-            $near   = $onRoad
-                ? self::placesNear((float) $r['last_lat'], (float) $r['last_lng'], $r['last_heading'] !== null ? (int) $r['last_heading'] : null, $kmh, $avg, $nowTs)
-                : null;
-            foreach ($near['need'] ?? [] as $c) {
+            $bus = self::busView($r, $nowTs, $cams[(int) $r['bus_id']] ?? [], $alerts[(int) ($r['trip_id'] ?? 0)] ?? []);
+            $counts[$bus['status']]++;
+            foreach ($bus['_need'] as $c) {
                 $need[$c] = true;
             }
-            $buses[] = [
-                'id'      => (int) $r['bus_id'],
-                'number'  => (string) $r['bus_number'],
-                'name'    => (string) $r['bus_name'],
-                'status'  => $status,
-                'age_s'   => $age,
-                'trip'    => $r['trip_id'] !== null ? [
-                    'id' => (int) $r['trip_id'],
-                    'started' => (int) strtotime((string) $r['started_at']) * 1000,
-                    'ended' => $r['ended_at'] !== null ? (int) strtotime((string) $r['ended_at']) * 1000 : null,
-                    'km' => round((float) $r['distance_km'], 1),
-                ] : null,
-                'driver'  => $r['driver_name'] !== null ? ['name' => (string) $r['driver_name'], 'phone' => (string) ($r['driver_phone'] ?? '')] : null,
-                'route'   => $r['route_code'] !== null ? ['code' => (string) $r['route_code'], 'label' => $r['from_city'] . ' → ' . $r['to_city']] : null,
-                'pos'     => $hasPos ? [
-                    'lat' => (float) $r['last_lat'], 'lng' => (float) $r['last_lng'],
-                    'kmh' => $kmh,
-                    'avg' => $avg,
-                    'hdg' => $r['last_heading'] !== null ? (int) $r['last_heading'] : null,
-                    'acc' => $r['last_accuracy_m'] !== null ? (float) $r['last_accuracy_m'] : null,
-                    'fix' => $r['last_fix_at'] !== null ? (int) strtotime((string) $r['last_fix_at']) * 1000 : null,
-                ] : null,
-                'battery' => $r['last_battery'] !== null && $status !== 'parked' ? (int) $r['last_battery'] : null,
-                'stop'    => $stop,
-                'place'   => $near['place'] ?? null,
-                'ahead'   => $near['ahead'] ?? null,
-                'towns'   => $near['ahead_list'] ?? [],
-                'temples' => $near['temples'] ?? [],
-                'cameras' => $cams[(int) $r['bus_id']] ?? [],
-            ];
+            unset($bus['_need']);
+            $buses[] = $bus;
         }
         // Moving buses first, then the rest in fleet order.
         $rank = ['live' => 0, 'weak' => 1, 'waiting' => 2, 'offline' => 3, 'parked' => 4, 'idle' => 5];
         usort($buses, static fn(array $a, array $b): int => [$rank[$a['status']], $a['id']] <=> [$rank[$b['status']], $b['id']]);
 
-        return ['now' => $nowTs * 1000, 'buses' => $buses, 'counts' => $counts, 'need_cells' => array_slice(array_keys($need), 0, 6)];
+        return ['now' => $nowTs * 1000, 'buses' => $buses, 'counts' => $counts,
+                'need_cells' => array_slice(array_keys($need), 0, 6), 'limit' => max(30, Settings::getInt('fleet_speed_limit', 80))];
+    }
+
+    /**
+     * What a passenger's link (bus-live.php?t=…) may see: that one bus —
+     * position, speed, stops, delay, towns and temples. No phone numbers,
+     * no cameras, no phone battery. The link stops working two hours after
+     * the trip ends.
+     *
+     * @return array{state:string, bus?:array<string,mixed>, now:int}
+     */
+    public static function shareView(string $token, ?int $nowTs = null): array
+    {
+        $nowTs = $nowTs ?? time();
+        if (preg_match('/^[a-f0-9]{24}$/', $token) !== 1) {
+            return ['state' => 'unknown', 'now' => $nowTs * 1000];
+        }
+        $r = Database::fetch(
+            self::ROW_SELECT . "
+               FROM fleet_trips t JOIN buses b ON b.id = t.bus_id
+               LEFT JOIN fleet_devices dv ON dv.id = t.device_id
+               LEFT JOIN drivers d ON d.id = t.driver_id
+               LEFT JOIN routes r ON r.id = t.route_id
+              WHERE t.share_token = :tok LIMIT 1",
+            ['tok' => $token]
+        );
+        if ($r === null) {
+            return ['state' => 'unknown', 'now' => $nowTs * 1000];
+        }
+        if ($r['trip_status'] !== 'running' && strtotime((string) $r['ended_at']) < $nowTs - 7200) {
+            return ['state' => 'expired', 'now' => $nowTs * 1000];
+        }
+        $bus = self::busView($r, $nowTs, [], []);
+        unset($bus['_need'], $bus['cameras'], $bus['battery'], $bus['phone'], $bus['alerts'], $bus['share']);
+        if ($bus['driver'] !== null) {
+            // First name only, like a ride-hailing app.
+            $bus['driver'] = ['name' => (string) strtok((string) $bus['driver']['name'], ' '), 'phone' => ''];
+        }
+        return ['state' => $r['trip_status'] === 'running' ? 'running' : 'ended', 'bus' => $bus, 'now' => $nowTs * 1000];
+    }
+
+    /**
+     * One bus, as every screen shows it.
+     *
+     * @param array<string,mixed> $r a ROW_SELECT row
+     * @param list<array<string,mixed>> $cams
+     * @param list<array<string,mixed>> $events open driver-reported events / episodes of its trip
+     * @return array<string,mixed>
+     */
+    private static function busView(array $r, int $nowTs, array $cams, array $events): array
+    {
+        $ping   = $r['last_ping_at'] !== null ? (int) strtotime((string) $r['last_ping_at']) : null;
+        $age    = $ping !== null ? max(0, $nowTs - $ping) : null;
+        $status = self::statusOf($r['trip_status'] !== null ? (string) $r['trip_status'] : null, $age);
+        $hasPos = $r['last_lat'] !== null;
+        $kmh    = $r['last_speed_kmh'] !== null ? (float) $r['last_speed_kmh'] : null;
+        $avg    = $r['avg_speed_kmh'] !== null ? (float) $r['avg_speed_kmh'] : null;
+        $onRoad = $hasPos && $status !== 'parked';
+        $stop   = $onRoad && $r['route_id'] !== null
+            ? self::stopInfo((int) $r['route_id'], (float) $r['last_lat'], (float) $r['last_lng'], $avg ?? $kmh) : null;
+        $near   = $onRoad
+            ? self::placesNear((float) $r['last_lat'], (float) $r['last_lng'], $r['last_heading'] !== null ? (int) $r['last_heading'] : null, $kmh, $avg, $nowTs)
+            : null;
+        $timeline = $r['trip_id'] !== null && $r['route_id'] !== null && $status !== 'parked' && $status !== 'idle'
+            ? self::timeline($r, $stop, $nowTs) : null;
+        $battery  = $r['last_battery'] !== null && $status !== 'parked' ? (int) $r['last_battery'] : null;
+        $charging = $r['last_charging'] !== null ? (int) $r['last_charging'] === 1 : null;
+
+        return [
+            'id'      => (int) $r['bus_id'],
+            'number'  => (string) $r['bus_number'],
+            'name'    => (string) $r['bus_name'],
+            'status'  => $status,
+            'age_s'   => $age,
+            'trip'    => $r['trip_id'] !== null ? [
+                'id' => (int) $r['trip_id'],
+                'started' => (int) strtotime((string) $r['started_at']) * 1000,
+                'ended' => $r['ended_at'] !== null ? (int) strtotime((string) $r['ended_at']) * 1000 : null,
+                'km' => round((float) $r['distance_km'], 1),
+                'max_kmh' => $r['max_speed_kmh'] !== null ? (float) $r['max_speed_kmh'] : null,
+            ] : null,
+            'driver'  => $r['driver_name'] !== null ? ['name' => (string) $r['driver_name'], 'phone' => (string) ($r['driver_phone'] ?? '')] : null,
+            'route'   => $r['route_code'] !== null ? ['code' => (string) $r['route_code'], 'label' => $r['from_city'] . ' → ' . $r['to_city']] : null,
+            'pos'     => $hasPos ? [
+                'lat' => (float) $r['last_lat'], 'lng' => (float) $r['last_lng'],
+                'kmh' => $kmh, 'avg' => $avg,
+                'hdg' => $r['last_heading'] !== null ? (int) $r['last_heading'] : null,
+                'acc' => $r['last_accuracy_m'] !== null ? (float) $r['last_accuracy_m'] : null,
+                'fix' => $r['last_fix_at'] !== null ? (int) strtotime((string) $r['last_fix_at']) * 1000 : null,
+            ] : null,
+            'battery' => $battery,
+            'phone'   => $status === 'parked' || $status === 'idle' ? null : [
+                'kind' => (string) ($r['device_kind'] ?? 'driver'), 'charging' => $charging,
+                'net' => $r['last_net'] !== null ? (string) $r['last_net'] : null,
+                'visible' => $r['last_visible'] !== null ? (int) $r['last_visible'] === 1 : null,
+                'alt' => $r['last_alt_m'] !== null ? (float) $r['last_alt_m'] : null,
+            ],
+            'stop'     => $stop,
+            'timeline' => $timeline,
+            'delay'    => $timeline['delay'] ?? null,
+            'place'    => $near['place'] ?? null,
+            'ahead'    => $near['ahead'] ?? null,
+            'towns'    => $near['ahead_list'] ?? [],
+            'temples'  => $near['temples'] ?? [],
+            'alerts'   => $status === 'parked' || $status === 'idle' ? [] : self::alertsFor($r, $status, $age, $battery, $charging, $events, $nowTs),
+            'share'    => $r['trip_status'] === 'running' ? $r['share_token'] : null,
+            'cameras'  => $cams,
+            '_need'    => $near['need'] ?? [],
+        ];
+    }
+
+    /**
+     * Open episodes / driver reports per running trip (ended_at IS NULL),
+     * newest first.
+     *
+     * @param list<int> $tripIds
+     * @return array<int, list<array<string,mixed>>>
+     */
+    private static function openAlerts(array $tripIds, int $nowTs): array
+    {
+        if ($tripIds === []) {
+            return [];
+        }
+        $ph = implode(',', array_fill(0, count($tripIds), '?'));
+        $out = [];
+        foreach (Database::fetchAll(
+            "SELECT id, trip_id, kind, started_at, peak FROM fleet_alerts WHERE ended_at IS NULL AND trip_id IN ($ph) ORDER BY started_at DESC",
+            $tripIds
+        ) as $a) {
+            $out[(int) $a['trip_id']][] = $a;
+        }
+        return $out;
+    }
+
+    /**
+     * Everything the office should notice about one bus right now, most
+     * serious first. level: red (act now) | amber (watch).
+     *
+     * @return list<array{key:string, level:string, icon:string, ne:string, en:string, id?:int}>
+     */
+    private static function alertsFor(array $r, string $status, ?int $age, ?int $battery, ?bool $charging, array $events, int $nowTs): array
+    {
+        $out = [];
+        foreach ($events as $e) {
+            $k = (string) $e['kind'];
+            if (isset(self::DRIVER_EVENTS[$k])) {
+                [$icon, $ne, $en] = self::DRIVER_EVENTS[$k];
+                $out[] = ['key' => $k . ':' . $e['id'], 'id' => (int) $e['id'], 'level' => in_array($k, ['sos', 'breakdown'], true) ? 'red' : 'amber',
+                    'icon' => $icon, 'ne' => $ne, 'en' => $en, 'since' => (int) strtotime((string) $e['started_at']) * 1000];
+            }
+        }
+        $limit = max(30, Settings::getInt('fleet_speed_limit', 80));
+        $kmh = $r['last_speed_kmh'] !== null ? (float) $r['last_speed_kmh'] : 0.0;
+        if ($r['overspeed_since'] !== null && $kmh > $limit && $nowTs - (int) strtotime((string) $r['overspeed_since']) >= 15) {
+            $out[] = ['key' => 'overspeed', 'level' => 'red', 'icon' => '⚠️', 'ne' => 'तीव्र गति ' . (int) round($kmh) . ' किमी/घण्टा (सीमा ' . $limit . ')',
+                'en' => 'Overspeed ' . (int) round($kmh) . ' km/h (limit ' . $limit . ')'];
+        }
+        if ($status === 'offline') {
+            $out[] = ['key' => 'nodata', 'level' => 'red', 'icon' => '📵', 'ne' => (int) round(($age ?? 0) / 60) . ' मिनेटदेखि लोकेसन आएको छैन',
+                'en' => 'No location for ' . (int) round(($age ?? 0) / 60) . ' min'];
+        }
+        if ($r['stopped_since'] !== null && $status !== 'offline') {
+            $min = intdiv($nowTs - (int) strtotime((string) $r['stopped_since']), 60);
+            if ($min >= max(1, Settings::getInt('fleet_stop_alert_min', 20))) {
+                $out[] = ['key' => 'stopped', 'level' => 'amber', 'icon' => '⏸️', 'ne' => $min . ' मिनेटदेखि रोकिएको', 'en' => 'Standing still ' . $min . ' min'];
+            }
+        }
+        if ($battery !== null && $battery < 20 && $charging !== true) {
+            $out[] = ['key' => 'battery', 'level' => 'amber', 'icon' => '🪫', 'ne' => 'फोनको ब्याट्री ' . $battery . '%', 'en' => 'Phone battery ' . $battery . '%'];
+        } elseif ($charging === false && ($r['device_kind'] ?? '') === 'vehicle') {
+            $out[] = ['key' => 'unplugged', 'level' => 'amber', 'icon' => '🔌', 'ne' => 'बस फोन चार्जरमा छैन', 'en' => 'Bus phone not on charge'];
+        }
+        if ($r['last_visible'] !== null && (int) $r['last_visible'] === 0 && $status !== 'offline') {
+            $out[] = ['key' => 'background', 'level' => 'amber', 'icon' => '📴', 'ne' => 'ड्राइभर एप स्क्रिनमा छैन', 'en' => 'Driver app not on screen'];
+        }
+        return $out;
+    }
+
+    /**
+     * Like the railways' running status: every stop of the route with its
+     * timetable time, when the bus really reached / left it, the expected
+     * time for the stops ahead and how late each is. `delay` is the latest
+     * known lateness in minutes (negative = early), or null without a
+     * timetable.
+     *
+     * @return array{stops:list<array<string,mixed>>, delay:?int, last_dep:?array<string,mixed>}
+     */
+    public static function timeline(array $trip, ?array $stop, int $nowTs): array
+    {
+        $stops = self::routeStops((int) $trip['route_id']);
+        $sched = self::schedTimes(['route_id' => $trip['route_id'], 'schedule_id' => $trip['schedule_id'] ?? null, 'started_at' => $trip['started_at']]);
+        $ev = [];
+        foreach (Database::fetchAll('SELECT stop_idx, arrived_at, departed_at FROM fleet_stop_events WHERE trip_id = :t', ['t' => (int) $trip['trip_id']]) as $e) {
+            $ev[(int) $e['stop_idx']] = $e;
+        }
+        $ms = static fn(?string $dt): ?int => $dt !== null ? (int) strtotime($dt) * 1000 : null;
+        $nextIdx = $stop['next_idx'] ?? null;
+        $out = [];
+        $delay = null;
+        $lastDep = null;
+        foreach ($stops as $i => $st) {
+            $state = $stop !== null && $stop['at'] && $i === $stop['near_idx'] ? 'at'
+                : ($nextIdx !== null && $i === $nextIdx ? 'next' : ($nextIdx !== null && $i > $nextIdx ? 'ahead' : 'done'));
+            $arr = $ms($ev[$i]['arrived_at'] ?? null);
+            $dep = $ms($ev[$i]['departed_at'] ?? null);
+            $eta = null;
+            if (($state === 'next' || $state === 'ahead') && $nextIdx !== null && isset($stop['upcoming'][$i - $nextIdx])) {
+                $eta = ($nowTs + (int) $stop['upcoming'][$i - $nextIdx]['min'] * 60) * 1000;
+            }
+            $sch = $ms($sched[$i] ?? null);
+            $base = $arr ?? $eta;
+            $late = $sch !== null && $base !== null ? (int) round(($base - $sch) / 60000) : null;
+            if ($late !== null && ($state === 'at' || $state === 'next' || ($state === 'done' && $arr !== null))) {
+                $delay = $late;      // the later in the list, the more current
+            }
+            if ($dep !== null) {
+                $lastDep = ['name' => $st['name'], 'ne' => $st['ne'], 'at' => $dep];
+            }
+            $out[] = ['name' => $st['name'], 'ne' => $st['ne'], 'state' => $state, 'sched' => $sch, 'arr' => $arr, 'dep' => $dep, 'eta' => $eta, 'late' => $late];
+        }
+        return ['stops' => $out, 'delay' => $delay, 'last_dep' => $lastDep];
+    }
+
+    /**
+     * A driver's one-tap report (SOS, breakdown, puncture, police check,
+     * meal halt) at the phone's last position.
+     */
+    public static function driverEvent(array $device, string $kind): int
+    {
+        if (!isset(self::DRIVER_EVENTS[$kind])) {
+            throw new RuntimeException('Unknown report.');
+        }
+        $trip = self::currentTrip($device);
+        if ($trip === null) {
+            throw new DomainException('no_trip');
+        }
+        // One open report of a kind per trip; tapping again just keeps it open.
+        $open = (int) Database::scalar("SELECT id FROM fleet_alerts WHERE trip_id = :t AND kind = :k AND ended_at IS NULL LIMIT 1",
+            ['t' => (int) $trip['id'], 'k' => $kind], 0);
+        if ($open > 0) {
+            return $open;
+        }
+        $id = Database::insert('fleet_alerts', ['trip_id' => (int) $trip['id'], 'bus_id' => (int) $trip['bus_id'], 'kind' => $kind,
+            'started_at' => date('Y-m-d H:i:s'), 'lat' => $trip['last_lat'], 'lng' => $trip['last_lng']]);
+        Logger::audit('fleet.driver.event', 'bus', (string) $trip['bus_id'], null, ['kind' => $kind, 'trip' => (int) $trip['id']]);
+        return $id;
+    }
+
+    /** The office (or the driver) marks a report as dealt with. */
+    public static function resolveAlert(int $alertId, int $by = 0): bool
+    {
+        $ok = Database::update('fleet_alerts', ['ended_at' => date('Y-m-d H:i:s')], 'id = :id AND ended_at IS NULL', ['id' => $alertId]) > 0;
+        if ($ok) {
+            Logger::audit('fleet.alert.resolve', 'alert', (string) $alertId, null, ['by' => $by]);
+        }
+        return $ok;
     }
 
     /**
@@ -702,7 +1281,58 @@ final class LiveFleet
         return array_reverse(array_map(static fn(array $r): array => [(float) $r['lng'], (float) $r['lat']], $rows));
     }
 
-    /** @var array<int, list<array{name:string,ne:string,lat:float,lng:float}>> */
+    /**
+     * A whole trip for playback: every kept point [ms, lng, lat, km/h, heading],
+     * when it reached / left each stop, and its alerts.
+     *
+     * @return array<string,mixed>
+     */
+    public static function replay(int $tripId): array
+    {
+        $t = Database::fetch(
+            'SELECT t.id, t.started_at, t.ended_at, t.distance_km, t.max_speed_kmh, b.bus_number, b.bus_name
+               FROM fleet_trips t JOIN buses b ON b.id = t.bus_id WHERE t.id = :id',
+            ['id' => $tripId]
+        );
+        if ($t === null) {
+            return ['trip' => null, 'points' => [], 'stops' => [], 'alerts' => []];
+        }
+        $ms = static fn(?string $dt): ?int => $dt !== null ? (int) strtotime($dt) * 1000 : null;
+        return [
+            'trip' => ['id' => (int) $t['id'], 'number' => (string) $t['bus_number'], 'name' => (string) $t['bus_name'],
+                'started' => $ms((string) $t['started_at']), 'ended' => $ms($t['ended_at']), 'km' => round((float) $t['distance_km'], 1),
+                'max_kmh' => $t['max_speed_kmh'] !== null ? (float) $t['max_speed_kmh'] : null],
+            'points' => array_map(static fn(array $p): array => [(int) strtotime((string) $p['recorded_at']) * 1000, (float) $p['lng'], (float) $p['lat'],
+                $p['speed_kmh'] !== null ? (float) $p['speed_kmh'] : null, $p['heading'] !== null ? (int) $p['heading'] : null],
+                Database::fetchAll('SELECT recorded_at, lat, lng, speed_kmh, heading FROM fleet_points WHERE trip_id = :t ORDER BY recorded_at, id LIMIT 30000', ['t' => $tripId])),
+            'stops' => array_map(static fn(array $e): array => ['name' => (string) $e['stop_name'], 'ne' => self::nepaliName((string) $e['stop_name']),
+                'arr' => $ms($e['arrived_at']), 'dep' => $ms($e['departed_at'])],
+                Database::fetchAll('SELECT stop_name, arrived_at, departed_at FROM fleet_stop_events WHERE trip_id = :t ORDER BY arrived_at', ['t' => $tripId])),
+            'alerts' => array_map(static fn(array $a): array => ['kind' => (string) $a['kind'], 'from' => $ms((string) $a['started_at']), 'to' => $ms($a['ended_at']),
+                'peak' => $a['peak'] !== null ? (float) $a['peak'] : null],
+                Database::fetchAll('SELECT kind, started_at, ended_at, peak FROM fleet_alerts WHERE trip_id = :t ORDER BY started_at', ['t' => $tripId])),
+        ];
+    }
+
+    /**
+     * The last trips of one bus, newest first — for picking a night to replay.
+     *
+     * @return list<array<string,mixed>>
+     */
+    public static function recentTrips(int $busId, int $limit = 12): array
+    {
+        return array_map(static fn(array $t): array => [
+            'id' => (int) $t['id'], 'started' => (int) strtotime((string) $t['started_at']) * 1000,
+            'ended' => $t['ended_at'] !== null ? (int) strtotime((string) $t['ended_at']) * 1000 : null,
+            'km' => round((float) $t['distance_km'], 1), 'driver' => (string) ($t['full_name'] ?? ''), 'running' => $t['status'] === 'running',
+        ], Database::fetchAll(
+            'SELECT t.id, t.started_at, t.ended_at, t.distance_km, t.status, d.full_name FROM fleet_trips t LEFT JOIN drivers d ON d.id = t.driver_id
+              WHERE t.bus_id = :b AND t.points > 0 ORDER BY t.id DESC LIMIT ' . max(1, min(50, $limit)),
+            ['b' => $busId]
+        ));
+    }
+
+    /** @var array<int, list<array{name:string,ne:string,lat:float,lng:float,time:?string}>> */
     private static array $stopCache = [];
 
     /**
@@ -716,30 +1346,45 @@ final class LiveFleet
      * ROAD_FACTOR, as EtaAlerts does) and minutes at the bus's average
      * moving speed, so the screens can say "Vadodara: 62 km, ~1 h 10 min".
      *
-     * @return array{near:string, near_ne:string, near_km:float, at:bool, next:string, next_ne:string,
+     * @return array{near:string, near_ne:string, near_km:float, at:bool, near_idx:int, next_idx:?int, next:string, next_ne:string,
      *               next_km:?float, next_min:?int, upcoming:list<array{name:string,ne:string,km:float,min:int}>}|null
      */
-    public static function stopInfo(int $routeId, float $lat, float $lng, ?float $kmh = null): ?array
+    /**
+     * The route as a line of stops on the road: boarding then drop, in
+     * timetable order, with coordinates. The same place listed twice in a
+     * row (boarding + drop at one office) is one stop.
+     *
+     * @return list<array{name:string,ne:string,lat:float,lng:float,time:?string}>
+     */
+    public static function routeStops(int $routeId): array
     {
         if (!isset(self::$stopCache[$routeId])) {
             $stops = [];
             foreach (Database::fetchAll(
-                "SELECT stop_name, latitude, longitude FROM route_stops
+                "SELECT stop_name, stop_time, latitude, longitude FROM route_stops
                   WHERE route_id = :r AND latitude IS NOT NULL AND longitude IS NOT NULL
                   ORDER BY stop_type = 'drop', sort_order, id",
                 ['r' => $routeId]
             ) as $s) {
-                $st = ['name' => (string) $s['stop_name'], 'lat' => (float) $s['latitude'], 'lng' => (float) $s['longitude']];
+                $st = ['name' => (string) $s['stop_name'], 'lat' => (float) $s['latitude'], 'lng' => (float) $s['longitude'],
+                       'time' => $s['stop_time'] !== null ? substr((string) $s['stop_time'], 0, 8) : null];
                 $prev = end($stops);
-                // The same place listed twice in a row (boarding + drop at one office) is one stop on the road.
                 if ($prev !== false && self::haversineKm($prev['lat'], $prev['lng'], $st['lat'], $st['lng']) < 0.3) {
+                    if ($prev['time'] === null && $st['time'] !== null) {
+                        $stops[count($stops) - 1]['time'] = $st['time'];
+                    }
                     continue;
                 }
                 $stops[] = $st + ['ne' => self::nepaliName($st['name'])];
             }
             self::$stopCache[$routeId] = $stops;
         }
-        $stops = self::$stopCache[$routeId];
+        return self::$stopCache[$routeId];
+    }
+
+    public static function stopInfo(int $routeId, float $lat, float $lng, ?float $kmh = null): ?array
+    {
+        $stops = self::routeStops($routeId);
         if ($stops === []) {
             return null;
         }
@@ -775,6 +1420,7 @@ final class LiveFleet
 
         return [
             'near' => $stops[$best]['name'], 'near_ne' => $stops[$best]['ne'], 'near_km' => round($bestKm, 1), 'at' => $at,
+            'near_idx' => $best, 'next_idx' => $nextIdx < count($stops) ? $nextIdx : null,
             'next' => $next['name'] ?? '', 'next_ne' => $next['ne'] ?? '',
             'next_km' => $next['km'] ?? null, 'next_min' => $next['min'] ?? null,
             'upcoming' => array_slice($upcoming, 0, 8),
@@ -1235,6 +1881,12 @@ final class LiveFleet
     {
         $path = ROOT_PATH . '/assets/livefleet/' . basename($file);
         return '/assets/livefleet/' . rawurlencode(basename($file)) . '?v=' . (is_file($path) ? substr((string) md5_file($path), 0, 10) : '0');
+    }
+
+    /** An Indian number plate (white, black letters, blue IND strip) — styled by livefleet.css. */
+    public static function plateHtml(string $number, string $size = ''): string
+    {
+        return '<span class="lf-plate' . ($size !== '' ? ' ' . $size : '') . '"><i>IND</i><b>' . Security::e($number !== '' ? $number : '—') . '</b></span>';
     }
 
     /* =================================================================

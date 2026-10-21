@@ -7,11 +7,16 @@
 #  What it does (and nothing else):
 #    1. copies every file under site/ to the same path in the website
 #       (all are NEW files — it stops if one already exists and differs)
-#    2. adds the three menu items to admin/_guard.php (patches/admin-nav.patch)
+#    2. adds the three menu items to admin/_guard.php and the fleet to the
+#       old Live Map (admin/map.php) — includes/livefleet-install.php, the
+#       same code as the web installer: backup first, parse check, CRLF kept
+#       (the same changes as patches/admin-nav.patch + admin-map.patch)
 #    3. prints the two commands still to run: the database upgrade and
 #       the hourly cleanup cron
 #
 #  It does NOT touch the database. Try it on a test copy first.
+#  No terminal on the server? Upload the files and open
+#  /admin/live-install.php as the super-admin instead.
 # =====================================================================
 set -euo pipefail
 
@@ -20,7 +25,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Works from the git repo (site/, patches/) and from the download zip
 # (1-upload-to-public_html/, 2-menu/).
 SRC="$HERE/site";                      [ -d "$SRC" ]   || SRC="$HERE/1-upload-to-public_html"
-PATCH="$HERE/patches/admin-nav.patch"; [ -f "$PATCH" ] || PATCH="$HERE/2-menu/admin-nav.patch"
 
 if [ -z "$SITE" ] || [ ! -f "$SITE/includes/bootstrap.php" ] || [ ! -f "$SITE/admin/_guard.php" ]; then
   echo "usage: bash tools/install.sh /path/to/website   (the folder that has includes/ and admin/)" >&2
@@ -43,25 +47,20 @@ while IFS= read -r -d '' f; do
   echo "   + $rel"
 done < <(find . -type f -print0 | sort -z)
 
-echo "== 2. Adding the menu items (admin/_guard.php)"
-if grep -q "live-fleet.php" "$SITE/admin/_guard.php"; then
-  echo "   already there"
-elif (cd "$SITE" && patch -p1 --dry-run --silent < "$PATCH" >/dev/null 2>&1); then
-  (cd "$SITE" && patch -p1 --silent < "$PATCH")
-  echo "   added: Live Fleet · TV Wall · Driver Login & CCTV"
-else
-  echo "   could not patch automatically — paste the 5 lines from 2-menu/MENU-5-LINES.txt by hand (docs/INSTALL-NEPALI.md, step 2)" >&2
-fi
+echo "== 2. Menu items (admin/_guard.php) + fleet on the old Live Map (admin/map.php)"
+php "$SITE/includes/livefleet-install.php" "$SITE" \
+  || echo "   not done automatically — paste the 5 lines from 2-menu/MENU-5-LINES.txt by hand (docs/INSTALL-NEPALI.md, step 2)" >&2
 
 # On the server the web files belong to www-data (see the site's CLAUDE.md).
 if [ "$(id -u)" = "0" ] && id www-data >/dev/null 2>&1; then
   chown www-data:www-data "${COPIED[@]}" "$SITE/driver" "$SITE/assets/livefleet"
+  for f in "$SITE/admin/_guard.php" "$SITE/admin/map.php" "$SITE"/admin/*.livefleet-*.bak; do [ -e "$f" ] && chown www-data:www-data "$f"; done
 fi
 
 cat <<EOF
 
 == 3. Still to do
-   a) Database (adds 6 new tables, changes nothing that exists):
+   a) Database (adds 10 new tables, changes nothing that exists):
         cd "$SITE" && php tests/apply-sql.php database/upgrade-2026-10-live-fleet.sql
 
    b) Hourly cleanup (crontab -e):
@@ -70,5 +69,6 @@ cat <<EOF
    c) Check it:
         cd "$SITE" && php -l includes/livefleet.php && php tests/live-fleet-test.php   (TEST database only)
 
-   Then: Admin → Map → Driver Login & CCTV → give a driver a Driver ID + PIN.
+   Then: Admin → Map → Vehicles & Drivers → pair a bus phone to each vehicle
+   number (📲), or give a driver a Driver ID + PIN.
 EOF
