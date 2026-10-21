@@ -6,7 +6,7 @@ Until a camera is added, the screens simply say *"No camera on this bus yet"*.
 
 > **नेपालीमा छोटकरीमा:** बसको DVR ले प्रायः `rtsp://` लिंक दिन्छ — ब्राउजरले त्यो सिधै चलाउन सक्दैन।
 > त्यसैले सर्भरमा एउटा सानो "गेटवे" (MediaMTX) राख्ने, जसले RTSP लाई `https://…/index.m3u8` (HLS) बनाइदिन्छ।
-> त्यो लिंक **Admin → Map → Driver Login & CCTV → CCTV cameras** मा हाल्ने। बस, भयो।
+> त्यो लिंक **Admin → Map → Vehicles & Drivers → CCTV cameras** मा हाल्ने। बस, भयो।
 
 ## 1. Which camera type to choose
 
@@ -68,7 +68,7 @@ server {
 
 ### 2.3 Add it in the admin
 
-**Admin → Map → Driver Login & CCTV → 📹 CCTV cameras**
+**Admin → Map → Vehicles & Drivers → 📹 CCTV cameras**
 
 - Bus: *SHG Himalaya Express*
 - Camera name: *Front road*

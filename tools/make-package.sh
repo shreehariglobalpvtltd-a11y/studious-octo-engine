@@ -6,7 +6,7 @@
 #
 #  Layout inside the zip (see docs/INSTALL-NEPALI.md):
 #    1-upload-to-public_html/   every file under site/, same paths as the website
-#    2-menu/                    the 5 menu lines + patches/admin-nav.patch
+#    2-menu/                    the 5 menu lines + patches/admin-nav.patch, admin-map.patch
 #    3-database/                the SQL upgrade
 #    4-tools/                   install.sh, test-local.sh, simulator, demo seed
 #    docs/                      CCTV, research, screenshots
@@ -22,7 +22,7 @@ PKG="$TMP/$NAME"
 
 mkdir -p "$PKG/1-upload-to-public_html" "$PKG/2-menu" "$PKG/3-database" "$PKG/4-tools" "$PKG/docs"
 cp -R "$HERE/site/." "$PKG/1-upload-to-public_html/"
-cp "$HERE/patches/admin-nav.patch" "$PKG/2-menu/"
+cp "$HERE/patches/admin-nav.patch" "$HERE/patches/admin-map.patch" "$PKG/2-menu/"
 # The five added lines, plain, for pasting by hand into admin/_guard.php.
 grep '^+' "$HERE/patches/admin-nav.patch" | grep -v '^+++' | sed 's/^+//; s/\r$//' > "$PKG/2-menu/MENU-5-LINES.txt"
 cp "$HERE/site/database/upgrade-2026-10-live-fleet.sql" "$PKG/3-database/"

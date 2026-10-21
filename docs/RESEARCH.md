@@ -69,3 +69,69 @@ So the original plan clearly was a per-driver live system; it was replaced by th
 - `tests/role-gates-test.php` connects to `127.0.0.1:3307` as `root` with no password (a developer laptop), so it cannot run elsewhere.
 - `tests/eta-alerts-test.php` refuses to run while any `livebus` row exists — after trying the
   simulator on a test database, clear it: `DELETE FROM kv_store WHERE kkey = 'livebus';`
+
+---
+
+# Round 3 (Oct 2026): what the best tracking systems do, and what Live Fleet took
+
+> **सारांश:** संसारका राम्रा ट्र्याकिङ प्रणाली (भारतीय रेलवेको NTES / Where is my Train, Uber, Flightradar24, Samsara,
+> Traccar, redBus, Chalo, Google Maps) हेरेर तिनका राम्रा कुरा यहाँ ल्याइयो: गाडी नम्बर अनुसार एउटा फोन, स्टप-स्टपको
+> रेलवे जस्तै स्थिति, SOS, चार्जर निकालिएको सूचना, यात्रुलाई लाइभ लिंक, Replay, र Google Map कै रङ।
+
+## The 25 features looked at, by priority
+
+| Pri | Feature | Seen in | In Live Fleet |
+|---|---|---|---|
+| 1 | Fleet list by **vehicle number**, one phone per plate | Samsara / Geotab, Traccar, Chalo | ✅ Vehicles & Drivers: regular driver per number, **bus phone** paired by one-time code / QR |
+| 1 | Smooth rotating vehicle icon, GPS-quality halo | Uber / Ola, Google Maps, Flightradar24 | ✅ white top-view coach, turns with heading, keeps last heading when parked, halo when the fix is poor |
+| 1 | GPS clean-up: spikes, parked jitter | Traccar filters, Uber map-matching | ✅ bad fixes dropped, max speed cap, **parked wobble adds no km**; ⏳ snap-to-road needs road geometry |
+| 1 | Station-by-station timeline with delay | **Indian Railways NTES / IRCTC**, Where is my Train | ✅ running status per stop from the fixes (arrival ≤ 1 km, departure > 1.5 km) vs the timetable, ढिलो / छिटो chips |
+| 1 | Status headline: left X at, next Y km, late, updated | NTES summary | ✅ `LF.headline` on every card, TV and passenger page |
+| 1 | ETA from road distance and moving speed | Chalo, redBus, Uber | ✅ road km (× 1.25) at the moving-average speed |
+| 1 | Phone health: battery, **charger**, screen off | Google location sharing, Samsara "Gateway Unplugged" | ✅ battery, charger, network, on-screen → alerts |
+| 1 | Store-and-forward without network | Where is my Train, Traccar Client | ✅ queue kept even across a reload; a late batch still records stops and alerts at the right times |
+| 1 | Exception alerts: overspeed, long halt, no data, late | Samsara, Geotab, Traccar | ✅ overspeed (15 s over the limit), long stop, no data, late bands; ⏳ off-route |
+| 1 | Passenger share link, no login | redBus, Uber "Share my trip" | ✅ `bus-live.php?t=…`, one bus, nothing private, ends 2 h after the trip |
+| 2 | Event-driven voice announcements | railway station PA, Samsara in-cab | ✅ Nepali, railway wording, station chime, siren for SOS, driver phone says the speed limit |
+| 2 | Click a vehicle → photo card | Flightradar24, Uber | ✅ our white coach + crest + plate |
+| 2 | Trip replay | Flightradar24 Playback, Traccar | ✅ 10× / 60× / 300×, seek slider |
+| 2 | Departure-board table for the office TV | station boards | ✅ `/admin/live-tv.php?layout=board` |
+| 2 | Driver SOS / breakdown buttons | Samsara driver app | ✅ SOS, breakdown, puncture, police check, meal halt |
+| 2 | Google-Maps-like colours | Google Maps, Uber custom map | ✅ measured from Google tiles, day + night |
+| 2 | Scalable 1-second feed | GTFS-Realtime | ✅ one stateless snapshot per request |
+| 2 | Route line done / remaining, geofence halts, WhatsApp "bus is near", service notices, daily report, safety score, on-time history, seat occupancy | various | ⏳ later — the data (`fleet_points`, `fleet_stop_events`, `fleet_alerts`) is already stored for them |
+
+## How the Google colours were matched
+
+Google's own map tiles may not legally be shown inside another map library, so the free OpenFreeMap "liberty" style is
+recoloured instead. Its 120 layer ids were matched to colours **measured from Google's tiles** at 20 places (Mumbai, Surat,
+Ahmedabad, Vadodara, Delhi, the Thar, Gir, Everest, the Gujarat coast…), light and dark: land `#f5f3f3` (warm `#f5f0e5`
+at low zoom), water `#90daee`, parks `#c3f1d5`, national highways slate-blue `#8ba5c1`, streets `#d8e0e7`, labels
+`#2f3034` / `#3c4043`; night: land `#1c2a40`, water `#00102e`, highways `#47688a`, town names `#f0f2f5`.
+`LiveFleet.applyLook(map, 'day' | 'night')` applies 128 rules; checked against the real liberty style with no style errors.
+
+## Nepali voices — what each screen can do
+
+| Device | Nepali voice | Advice |
+|---|---|---|
+| **Microsoft Edge** (Windows / Mac) | ✅ *Hemkala*, *Sagar* (online, natural) | best for the office TV PC; start with `--autoplay-policy=no-user-gesture-required` to speak without a tap |
+| Chrome on Android (also the bus phone) | ✅ after Settings → Text-to-speech → Speech Services by Google → Install voice data → नेपाली | |
+| Chrome on Windows / Mac | ❌ — Hindi voice reads the Devanagari | understandable, Hindi accent |
+| Android TV box with Fully Kiosk | no Web Speech — Live Fleet uses Fully's own `fully.textToSpeech` | |
+| iPhone / Safari | ❌ Nepali, needs a tap every page load | fine for staff, not for an unattended TV |
+
+Every sentence is spoken as its own utterance (Chrome cuts long ones after ~15 s); a voice that fails (an online voice
+with the internet down) is skipped from then on; if the browser refuses to speak, the 🔊 button comes back.
+
+## What a phone in the bus can report (Android Chrome)
+
+| Signal | API | Used for |
+|---|---|---|
+| position, accuracy, speed, heading, altitude | `geolocation.watchPosition` (only while the page is on screen) | live map, trail, km, ETA, stops |
+| battery %, **charging** | `navigator.getBattery()` | low battery, **unplugged** alerts |
+| network type | `navigator.connection.effectiveType` / `type` | "weak network" vs "bus stopped" |
+| page on screen | `visibilitychange` (+ a last `keepalive` ping when hidden) | "app off screen" alert |
+| screen kept awake | `navigator.wakeLock` | keeps GPS flowing |
+
+The one thing a web page cannot do is read GPS with the screen off — for that the driver page offers **Traccar Client**
+(`api/fleet-osmand.php`), which keeps sending in the background.
