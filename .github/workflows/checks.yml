@@ -1,0 +1,61 @@
+name: Live Fleet checks
+
+# Installs Live Fleet into a fresh copy of the website (public repo
+# shreehariglobalpvtltd-a11y/shreehari) on a throw-away MySQL 8 database
+# and runs the engine tests, the HTTP tests and a simulator smoke run.
+# No secrets, no deploy, nothing is sent anywhere.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: livefleet-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: PHP 8.3 + MySQL 8
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Set up PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_mysql, gd, curl, mbstring
+          coverage: none
+          tools: none
+      - name: Set up Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Syntax
+        run: |
+          find site tools -type f -name '*.php' -print0 | xargs -0 -n1 php -l
+          node --check site/assets/livefleet/livefleet.js
+          node -e "JSON.parse(require('node:fs').readFileSync('site/driver/manifest.webmanifest','utf8'))"
+          for f in tools/*.sh; do bash -n "$f"; done
+      - name: Install into the website and run every Live Fleet test
+        env:
+          MYSQL: mysql -h127.0.0.1 -uroot -proot
+        run: bash tools/test-local.sh "$RUNNER_TEMP/site"

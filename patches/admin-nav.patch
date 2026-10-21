@@ -1,0 +1,16 @@
+diff --git a/admin/_guard.php b/admin/_guard.php
+index cac4622..1eeea95 100644
+--- a/admin/_guard.php
++++ b/admin/_guard.php
+@@ -143,6 +143,11 @@ function admin_nav(): array
+ 
+         // Map — routes, stops, head office and the driver's live position (5 Sep 2026).
+         ['href' => 'map.php',          'icon' => 'map-pin',      'label' => 'Live Map',         'perm' => 'schedules.view', 'section' => 'Map'],
++        // Live Fleet (Oct 2026): every bus from its own driver's phone, 1 s refresh,
++        // CCTV per bus and a full-screen TV wall. See includes/livefleet.php.
++        ['href' => 'live-fleet.php',   'icon' => 'map-pin',      'label' => 'Live Fleet',       'perm' => 'schedules.view', 'section' => 'Map'],
++        ['href' => 'live-tv.php',      'icon' => 'grid',         'label' => 'TV Wall',          'perm' => 'schedules.view', 'section' => 'Map'],
++        ['href' => 'live-setup.php',   'icon' => 'cog',          'label' => 'Driver Login & CCTV', 'perm' => 'drivers.edit', 'section' => 'Map'],
+     ];
+ 
+     return array_values(array_filter($all, static fn(array $i): bool => $i['perm'] === '' || Auth::can($i['perm'])));
