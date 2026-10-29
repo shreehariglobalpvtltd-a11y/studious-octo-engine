@@ -1,8 +1,9 @@
-name: Live Fleet checks
+name: Live Fleet + Agent Pro checks
 
-# Installs Live Fleet into a fresh copy of the website (public repo
-# shreehariglobalpvtltd-a11y/shreehari) on a throw-away MySQL 8 database
-# and runs the engine tests, the HTTP tests and a simulator smoke run.
+# Installs Live Fleet and Agent Pro into a fresh copy of the website (public
+# repo shreehariglobalpvtltd-a11y/shreehari) on a throw-away MySQL 8 database
+# and runs the engine tests, the WhatsApp/AI tests (against a mock Ollama),
+# the HTTP tests and a simulator smoke run.
 # No secrets, no deploy, nothing is sent anywhere.
 
 on:
@@ -41,7 +42,7 @@ jobs:
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
         with:
           php-version: '8.3'
-          extensions: pdo_mysql, gd, curl, mbstring
+          extensions: pdo_mysql, gd, curl, mbstring, sodium, zlib, openssl
           coverage: none
           tools: none
       - name: Set up Node
@@ -49,13 +50,20 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
+      - name: QR decoder + OCR (lets the card and ID-reading tests check more; they skip without)
+        continue-on-error: true
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends zbar-tools tesseract-ocr tesseract-ocr-hin tesseract-ocr-nep
       - name: Syntax
         run: |
           find site tools -type f -name '*.php' -print0 | xargs -0 -n1 php -l
           node --check site/assets/livefleet/livefleet.js
+          node --check site/assets/agentpro/join.js
+          node --check site/assets/agentpro/me.js
+          node --check tools/agentpro-browser-test.cjs
+          node -e "JSON.parse(require('node:fs').readFileSync('site/me/manifest.webmanifest','utf8'))"
           node -e "JSON.parse(require('node:fs').readFileSync('site/driver/manifest.webmanifest','utf8'))"
           for f in tools/*.sh; do bash -n "$f"; done
-      - name: Install into the website and run every Live Fleet test
+      - name: Install into the website and run every Live Fleet + Agent Pro test
         env:
           MYSQL: mysql -h127.0.0.1 -uroot -proot
         run: bash tools/test-local.sh "$RUNNER_TEMP/site"
