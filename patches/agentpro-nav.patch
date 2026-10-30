@@ -1,0 +1,22 @@
+--- a/admin/_guard.php
++++ b/admin/_guard.php
+@@ -104,6 +104,11 @@
+         ['href' => 'agent-offline.php','icon' => 'notepad',   'label' => 'Paper Tickets',    'perm' => $agentView ? 'bookings.view' : 'commissions.view',  'section' => 'Agents'],
+         ['href' => 'agent-ranking.php','icon' => 'trophy',    'label' => 'Agent Ranking',    'perm' => 'dashboard.view', 'section' => 'Agents'],
+         ['href' => 'staff.php',        'icon' => 'user-cog',  'label' => 'Staff & Approvals', 'perm' => 'staff.manage',  'section' => 'Agents'],
++        // Agent Pro (Oct 2026): Control Center, team + ID cards + join approvals, every member's own
++        // ID / visiting card / wallet page. See includes/agentpro.php and docs/AGENT-PRO-DESIGN.md.
++        ['href' => 'hub.php',          'icon' => 'grid',      'label' => 'Control Center',   'perm' => 'dashboard.view', 'section' => ''],
++        ['href' => 'team.php',         'icon' => 'id-card',   'label' => 'Team & ID Cards',  'perm' => 'commissions.view', 'section' => 'Agents'],
++        ['href' => '/me/',             'icon' => 'wallet',    'label' => 'My ID & Wallet',   'perm' => '', 'section' => 'Agents'],
+ 
+         // Customers — leads and the people who travelled. An agent's own
+         // bookings are scoped by sold_by_admin_id, but an unclaimed lead has
+@@ -140,6 +145,7 @@
+         ['href' => 'health.php',       'icon' => 'alert',     'label' => 'System Health',    'perm' => 'dashboard.view', 'section' => 'Settings'],
+         ['href' => 'ai-knowledge.php', 'icon' => 'doc',       'label' => 'AI Knowledge',     'perm' => 'dashboard.view', 'section' => 'Settings'],
+         ['href' => 'ai-activity.php',  'icon' => 'msg',       'label' => 'AI Activity',      'perm' => 'dashboard.view', 'section' => 'Settings'],
++        ['href' => 'ai-local.php',     'icon' => 'sparkle',   'label' => 'AI (VPS) & WhatsApp', 'perm' => 'dashboard.view', 'section' => 'Settings'],
+ 
+         // Map — routes, stops, head office and the driver's live position (5 Sep 2026).
+         ['href' => 'map.php',          'icon' => 'map-pin',      'label' => 'Live Map',         'perm' => 'schedules.view', 'section' => 'Map'],

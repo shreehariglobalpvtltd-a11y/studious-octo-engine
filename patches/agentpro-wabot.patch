@@ -1,0 +1,32 @@
+--- a/includes/wabot.php
++++ b/includes/wabot.php
+@@ -46,6 +46,16 @@
+         $body         = trim($body);
+         $senderDigits = normalisePhone($from);
+ 
++        // Agent Pro (Oct 2026): the agents' and staff WhatsApp desk (LINK + OTP, wallet, cards, ticket
++        // sale and edits) and the join form's "JOIN 123456". Null = not ours. See includes/agentpro-wa.php.
++        if (is_file(INCLUDE_PATH . '/agentpro-wa.php')) {
++            require_once INCLUDE_PATH . '/agentpro-wa.php';
++            $apReply = ApWa::reply($from, $body, $kind);
++            if ($apReply !== null) {
++                return self::out($apReply['text'], $apReply['media'] ?? null);
++            }
++        }
++
+         /* A photo or a file with no caption: on this number that is a
+            payment screenshot nine times out of ten. The generic menu told
+            the sender nothing about the money they had just sent, so say
+@@ -147,7 +157,11 @@
+         if (!$pnrOnly) {
+             try {
+                 require_once INCLUDE_PATH . '/aiagent.php';
+-                $agent = AiAgent::handle($from, $body);
++                // Agent Pro (Oct 2026): when the AI on this VPS is on, it answers instead of the cloud model.
++                if (is_file(INCLUDE_PATH . '/agentpro-wa.php')) {
++                    require_once INCLUDE_PATH . '/agentpro-wa.php';
++                }
++                $agent = class_exists('ApWa') && ApWa::customerBrainOn() ? ApWa::customerTurn($from, $body) : AiAgent::handle($from, $body);
+                 if ($agent !== null) {
+                     return self::out($agent['text'], $agent['media']);
+                 }

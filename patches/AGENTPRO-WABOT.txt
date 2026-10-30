@@ -1,0 +1,44 @@
+Agent Pro — the two WhatsApp hooks in includes/wabot.php
+==========================================================
+
+Only needed when /admin/agentpro-install.php (or tools/agentpro-install.sh)
+says it could not add them itself. Make a copy of includes/wabot.php first.
+The same change as a patch: agentpro-wabot.patch (patch -p1 < agentpro-wabot.patch).
+
+
+HOOK 1 — the agents' and staff WhatsApp desk
+--------------------------------------------
+Find this line (near the top of the reply function):
+
+        $senderDigits = normalisePhone($from);
+
+and paste these lines right AFTER it:
+
+        // Agent Pro (Oct 2026): the agents' and staff WhatsApp desk (LINK + OTP, wallet, cards, ticket
+        // sale and edits) and the join form's "JOIN 123456". Null = not ours. See includes/agentpro-wa.php.
+        if (is_file(INCLUDE_PATH . '/agentpro-wa.php')) {
+            require_once INCLUDE_PATH . '/agentpro-wa.php';
+            $apReply = ApWa::reply($from, $body, $kind);
+            if ($apReply !== null) {
+                return self::out($apReply['text'], $apReply['media'] ?? null);
+            }
+        }
+
+
+HOOK 2 — passengers answered by the free AI on your VPS (only when it is switched on)
+-------------------------------------------------------------------------------------
+Find this line:
+
+                $agent = AiAgent::handle($from, $body);
+
+and REPLACE it with:
+
+                // Agent Pro (Oct 2026): when the AI on this VPS is on, it answers instead of the cloud model.
+                if (is_file(INCLUDE_PATH . '/agentpro-wa.php')) {
+                    require_once INCLUDE_PATH . '/agentpro-wa.php';
+                }
+                $agent = class_exists('ApWa') && ApWa::customerBrainOn() ? ApWa::customerTurn($from, $body) : AiAgent::handle($from, $body);
+
+
+Check: php -l includes/wabot.php   → "No syntax errors detected"
+Undo:  put the copy back. Nothing else depends on these lines.

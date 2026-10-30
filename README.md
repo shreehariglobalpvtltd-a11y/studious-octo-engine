@@ -1,3 +1,70 @@
+# S Hari Global — website add-ons
+
+Two add-ons for **shreehariglobal.in**, each a set of new files plus a one-click installer, with tests:
+
+- **[🪪 Agent Pro](#-agent-pro--id-cards-visiting-cards-wallet-and-a-whatsapp-desk)** (Oct 2026) — ID card + visiting card for every agent and staff member, a UPI-style wallet, a 5-minute join form that fills itself from the ID, one-tap approval, and a WhatsApp desk in Nepali / Hindi / English, with optional free AI on your own VPS.
+- **[🛰️ Live Fleet](#%EF%B8%8F-live-fleet--live-bus-tracking-for-shreehariglobalin)** — live bus tracking by vehicle number.
+
+---
+
+# 🪪 Agent Pro — ID cards, visiting cards, wallet and a WhatsApp desk
+
+> **नेपालीमा:** हरेक एजेन्ट र स्टाफको प्रिमियम **ID कार्ड** (पछाडि QR → "✓ VALID") र **भिजिटिङ कार्ड** (`WA: +91 …` छापिएको,
+> QR स्क्यान गर्दा सिधै WhatsApp च्याट)। नयाँ एजेन्टले `/join.php` मा Aadhaar / नागरिकताको फोटो खिच्दा फारम **आफैं भरिन्छ**,
+> अफिसले **एउटै ✓ Approve** थिच्छ — कोड, कार्ड, लगइन WhatsApp मा आफैं जान्छ। हरेकको आफ्नै मोबाइल पेज `/me/`:
+> ID, कार्ड, **Paytm / PhonePe जस्तै वालेट** (withdraw, कम्पनीलाई UPI मा जम्मा), कागजात, फोटो, औंठाछाप लगइन।
+> WhatsApp मा **नेपाली / हिन्दी / English**: ब्यालेन्स, स्टेटमेन्ट, टिकट काट्ने र सच्याउने — AI चाहिए **आफ्नै VPS** मा फ्री
+> (Ollama, `qwen3.5:4b`)। पूरा तरिका: **[docs/AGENT-PRO-NEPALI.md](docs/AGENT-PRO-NEPALI.md)**।
+
+| ID card — front | ID card — back (verify QR) | Visiting card — front · back (WhatsApp QR) |
+|---|---|---|
+| ![ID front](docs/card-design/sample-id-front.png) | ![ID back](docs/card-design/sample-id-back.png) | ![VC front](docs/card-design/sample-vc-front.png) ![VC back](docs/card-design/sample-vc-back.png) |
+
+| Join form — reads the ID's QR | One-tap approve | Member's wallet (UPI style) | Pay the company by UPI QR |
+|---|---|---|---|
+| ![Join](docs/screenshots/ap-join-3-id-autofill.png) | ![Approve](docs/screenshots/ap-admin-approve.png) | ![Wallet](docs/screenshots/ap-me-wallet.png) | ![Pay](docs/screenshots/ap-me-pay.png) |
+
+| Control Center (desktop) | Control Center (phone) | Public card page (`c.php`) | ID check (`id.php`) |
+|---|---|---|---|
+| ![Hub](docs/screenshots/ap-admin-hub.png) | ![Hub phone](docs/screenshots/ap-admin-hub-phone.png) | ![Card page](docs/screenshots/ap-card-page.png) | ![Verify](docs/screenshots/ap-verify.png) |
+
+*(The portraits are drawn illustrations from the demo seed; the green "photo" in some screenshots is Chromium's fake test camera.)*
+
+### ⬇️ Download and install
+
+**[agent-pro-shreehari.zip](https://github.com/shreehariglobalpvtltd-a11y/studious-octo-engine/raw/ccr-38414d31-y3cy2h/dist/agent-pro-shreehari.zip)** —
+`1-upload-to-public_html/` (the files), `2-menu/` (menu lines + WhatsApp hooks, as text and patches), `3-database/` (the SQL),
+`4-tools/` (installer, demo seed, mock AI, browser test) and **`PADHNUHOS-PAHILE-YO.md`** (the Nepali guide).
+Rebuild with `bash tools/make-agentpro-package.sh dist`.
+
+1. Upload `1-upload-to-public_html/` into `public_html/`.
+2. Open `/admin/agentpro-install.php` as the super-admin → **Install all** (9 new tables + settings, 4 menu items, 2 WhatsApp hooks; backups first).
+   With SSH: `bash tools/agentpro-install.sh /path/to/public_html`.
+3. Cron, every minute: `* * * * * php …/public_html/cron/agentpro-worker.php >/dev/null 2>&1`.
+4. Optional: `apt install tesseract-ocr tesseract-ocr-hin tesseract-ocr-nep`; `curl -fsSL https://ollama.com/install.sh | sh && ollama pull qwen3.5:4b`,
+   then **Admin → Settings → AI (VPS) & WhatsApp** → turn it on → **Run 5 tests**.
+
+### What you get
+
+| Screen | Address | Who | What it does |
+|---|---|---|---|
+| **Join form** | `/join.php` | anyone with the link | 6 steps, NE / HI / EN. WhatsApp verified (OTP, or one tap sends `JOIN 123456`). ID photo → **Aadhaar QR read in the browser** (name, DOB, gender, address); passport MRZ; Nepali citizenship / PAN / voter / licence by OCR or the VPS model. Selfie with a face oval (it becomes the ID photo), thumb impression, front/back + extra documents, bank / UPI / eSewa optional. |
+| **Control Center** | `/admin/hub.php` | staff | Greeting, quick actions, KPIs, "needs attention" (approvals, withdrawals, payments in, KYC, failed WhatsApp), every menu item as **category cards**. Phone-first. |
+| **Team & ID Cards** | `/admin/team.php` | managers | Approvals (**✓ Approve = code + active + KYC verified + photo + cards + WhatsApp welcome**), agents, staff, money (pay a withdrawal / confirm a payment in one tap), print sheets (A4, 300 dpi, mirrored backs), staff invites. |
+| **My ID & Wallet** | `/me/` | every agent / staff member | Sign in with agent code + mobile + WhatsApp OTP, then **fingerprint / face** (passkey). ID card (tap to flip), visiting card (edit WhatsApp number, tagline, greeting, theme — the card re-prints at once), wallet, passbook, statement PDF, documents, profile photo = ID photo, bank details. Installable as an app. |
+| **ID check** | `/id.php?c=…` | whoever scans the ID QR | ✓ VALID / SUSPENDED / EXPIRED / REVOKED with the photo, code, branch, company CIN and address. |
+| **Digital visiting card** | `/c.php?u=…` | anyone | The card, WhatsApp / call / save contact (vCard) / book a ticket with the agent's code. |
+| **AI (VPS) & WhatsApp** | `/admin/ai-local.php` | super-admin | Finds Ollama, lists models and what they can do, recommends one for the VPS's RAM, pulls it, runs a 5-task NE / HI / EN benchmark, switches. |
+| **WhatsApp desk** | your WhatsApp number | agents, staff | `LINK SHG-0027` + OTP once; then `balance`, `statement`, `withdraw 2000`, `jama 1500 UTR …`, `id card`, `visiting card`, `office` (with CIN), `contacts`, `bus`, `aaja`, `passengers bholi`, a sale in plain words (quote first, **ho** to sell), `SHG-… name Sita Thapa` / pickup / seat / date / `cancel` / `resend`. |
+
+### Tests
+
+`bash tools/test-local.sh` installs both add-ons into a fresh copy of the website on a throw-away database and runs every suite
+(Agent Pro: 140 engine checks, 79 WhatsApp + AI checks against a mock Ollama, 70 HTTP checks). `BROWSER=1` adds a Playwright
+journey on a phone and a desktop (27 checks: join → approve → `/me/` → fingerprint sign-in → `id.php` / `c.php`). Design: [docs/AGENT-PRO-DESIGN.md](docs/AGENT-PRO-DESIGN.md).
+
+---
+
 # 🛰️ Live Fleet — live bus tracking for shreehariglobal.in
 
 Every bus **by its vehicle number** on one map, **live, refreshed every second**, from the phone in that bus.
