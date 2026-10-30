@@ -15,8 +15,7 @@
 #    - only admin/_guard.php and includes/wabot.php are edited, each with
 #      its own .bak copy and a PHP parse check
 #    - the SQL only creates ap_* tables and adds settings (INSERT IGNORE)
-#    - it prints the exact undo commands at the end (put the two edited
-#      files back; the new tables and files are then simply unused)
+#    - it prints the exact undo commands (at the end, or where it stops)
 #
 #  Settings (environment): SITE (website folder), ZIP (a local package
 #  instead of downloading), BASE_URL (address for the tests).
@@ -25,17 +24,34 @@ set -euo pipefail
 
 SITE="${SITE:-/var/www/shreehariglobal.in/public_html}"
 BASE_URL="${BASE_URL:-https://www.shreehariglobal.in}"
-ZIP_URL="${ZIP_URL:-https://github.com/shreehariglobalpvtltd-a11y/studious-octo-engine/raw/ccr-38414d31-y3cy2h/dist/agent-pro-shreehari.zip}"
+# Pinned to one commit, and checked against its SHA-256 before anything in it runs as root.
+ZIP_URL="${ZIP_URL:-https://github.com/shreehariglobalpvtltd-a11y/studious-octo-engine/raw/669dbbb3bf6e7019bd966376461aee7848272772/dist/agent-pro-shreehari.zip}"
+ZIP_SHA256="${ZIP_SHA256:-25178b127879ca93e280fb89a21b48c6cbab56e80d498801423ca9c885199dc0}"
 ZIP="${ZIP:-}"
 BACKUPS="${BACKUPS:-/root/backups}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-MODE="deploy"
-[ "${1:-}" = "--check" ] && MODE="check"
+case "${1:-}" in
+  "")      MODE="deploy" ;;
+  --check) MODE="check" ;;
+  *) printf 'Unknown option: %s\nUse:  bash agentpro-deploy.sh           (install)\n      bash agentpro-deploy.sh --check   (only test)\n' "$1" >&2; exit 2 ;;
+esac
 
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; FAILS=$((FAILS + 1)); }
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-die()  { printf '\n\033[31mSTOPPED:\033[0m %s\nNothing after this point was changed.\n' "$*" >&2; exit 1; }
+CHANGED=0
+die() {
+  printf '\n\033[31mSTOPPED:\033[0m %s\n' "$*" >&2
+  if [ "$CHANGED" = 1 ]; then
+    printf 'The Agent Pro files and the menu / WhatsApp edits are ALREADY in place.\nFix the problem above and run this script again (that is safe), or undo:\n' >&2
+    [ -n "${GUARD_BAK:-}" ] && printf '  cp -p "%s" "%s"\n' "$GUARD_BAK" "$SITE/admin/_guard.php" >&2
+    [ -n "${WABOT_BAK:-}" ] && printf '  cp -p "%s" "%s"\n' "$WABOT_BAK" "$SITE/includes/wabot.php" >&2
+    printf 'Backups: %s  %s\n' "${FILES_BAK:-}" "${DB_BAK:-}" >&2
+  else
+    printf 'Nothing on the website was changed.\n' >&2
+  fi
+  exit 1
+}
 FAILS=0
 
 [ -f "$SITE/includes/bootstrap.php" ] && [ -f "$SITE/admin/_guard.php" ] || die "no website at $SITE (set SITE=/path/to/public_html)"
@@ -85,9 +101,16 @@ run_tests() {
   c="$(http /me/)";                      [ "$c" = 200 ] && ok "member portal opens (/me/)"             || bad "/me/ answered $c"
   body '/api/agentpro.php?a=csrf' | grep -q '"ok":true' && ok "Agent Pro API answers"                || bad "/api/agentpro.php?a=csrf did not answer ok"
   c="$(http '/id.php?c=not-a-real-card')"; case "$c" in 200|404) ok "ID check page works (unknown card → NOT VALID)";; *) bad "/id.php answered $c";; esac
-  c="$(http /admin/hub.php)";            case "$c" in 200|301|302|303) ok "Control Center protected by login ($c)";; *) bad "/admin/hub.php answered $c";; esac
+  c="$(http /admin/hub.php)";            case "$c" in 301|302|303) ok "Control Center protected by login ($c)";; *) bad "/admin/hub.php answered $c to a visitor who is not signed in (expected a redirect to the login page)";; esac
   c="$(http '/api/agentpro-card.php?m=1&s=id-front')"; case "$c" in 401|403) ok "ID card images need a login or a signed link ($c)";; *) bad "ID card image answered $c without a login";; esac
-  c="$(http /uploads/agents-kyc/x.jpg)"; case "$c" in 403|404) ok "KYC documents folder is not public ($c)";; *) bad "/uploads/agents-kyc/ answered $c — add: location ^~ /uploads/agents-kyc/ { deny all; }";; esac
+  # A real file, so a 404 means "blocked", not "not there".
+  local probe="ap-probe-$$.txt"
+  if [ -d uploads/agents-kyc ] && printf 'probe' > "uploads/agents-kyc/$probe" 2>/dev/null; then
+    c="$(http "/uploads/agents-kyc/$probe")"; rm -f "uploads/agents-kyc/$probe"
+    case "$c" in 200) bad "KYC documents are PUBLIC — add to nginx: location ^~ /uploads/agents-kyc/ { deny all; return 404; }";; *) ok "KYC documents folder is not public ($c)";; esac
+  else
+    echo "  · KYC folder check skipped (uploads/agents-kyc not there yet)"
+  fi
 
   if crontab -u www-data -l 2>/dev/null | grep -q 'cron/agentpro-worker.php'; then ok "worker cron set (every minute, as www-data)"
   else bad "worker cron missing"; fi
@@ -116,7 +139,12 @@ mkdir -p "$BACKUPS"
 chmod 700 "$BACKUPS"
 FILES_BAK="$BACKUPS/site-before-agentpro-$STAMP.tgz"
 DB_BAK="$BACKUPS/$DB_NAME-before-agentpro-$STAMP.sql.gz"
-tar -czf "$FILES_BAK" -C "$(dirname "$SITE")" "$(basename "$SITE")" || die "file backup failed"
+NEED_KB=$(( $(du -sk "$SITE" | cut -f1) + 1048576 ))      # the site's size + 1 GB of room
+FREE_KB=$(df -Pk "$BACKUPS" | awk 'NR==2 {print $4}')
+[ "$FREE_KB" -gt "$NEED_KB" ] || die "not enough free disk for the backup (need ~$((NEED_KB / 1024)) MB, have $((FREE_KB / 1024)) MB)"
+# A live site writes logs while tar reads them: "file changed as we read it" (exit 1) is fine.
+rc=0; tar --warning=no-file-changed --warning=no-file-removed -czf "$FILES_BAK" -C "$(dirname "$SITE")" "$(basename "$SITE")" || rc=$?
+[ "$rc" -le 1 ] || { rm -f "$FILES_BAK"; die "file backup failed (tar exit $rc)"; }
 ok "files: $FILES_BAK ($(du -h "$FILES_BAK" | cut -f1))"
 # MariaDB's root uses the unix socket on this server; fall back to the site's own login
 # through a private temporary file (never printed, removed straight after).
@@ -128,8 +156,11 @@ else
   sitephp -r 'define("SHG_APP", true); require "includes/bootstrap.php";
     $h = DB_HOST; $port = ""; if (str_contains($h, ";port=")) { [$h, $port] = explode(";port=", $h, 2); }
     echo "[client]\nuser=" . DB_USER . "\npassword=\"" . addcslashes(DB_PASS, "\"\\\\") . "\"\nhost=" . $h . ($port !== "" ? "\nport=" . $port : "") . "\n";' > "$CNF"
-  mysqldump --defaults-extra-file="$CNF" --single-transaction --no-tablespaces "$DB_NAME" 2>/dev/null | gzip > "$DB_BAK"
-  rm -f "$CNF"
+  if ! mysqldump --defaults-extra-file="$CNF" --single-transaction --no-tablespaces "$DB_NAME" 2>"$BACKUPS/.dump-err" | gzip > "$DB_BAK"; then
+    rm -f "$CNF" "$DB_BAK"
+    die "database backup failed: $(tail -1 "$BACKUPS/.dump-err" 2>/dev/null)"
+  fi
+  rm -f "$CNF" "$BACKUPS/.dump-err"
   [ "$(gzip -dc "$DB_BAK" | head -c 4096 | grep -c 'CREATE TABLE\|Dump')" -gt 0 ] || die "database backup failed — nothing was changed"
   ok "database: $DB_BAK ($(du -h "$DB_BAK" | cut -f1))"
 fi
@@ -141,6 +172,9 @@ if [ -z "$ZIP" ]; then
   command -v curl >/dev/null || die "curl is not installed"
   curl -fsSL -m 120 -o "$WORK/agent-pro.zip" "$ZIP_URL" || die "could not download $ZIP_URL"
   ZIP="$WORK/agent-pro.zip"
+  GOT="$(sha256sum "$ZIP" | cut -d' ' -f1)"
+  [ "$GOT" = "$ZIP_SHA256" ] || die "the downloaded package does not match its fingerprint (got $GOT) — not installing it"
+  ok "download verified (SHA-256 matches)"
 fi
 command -v unzip >/dev/null || { apt-get install -y -qq unzip >/dev/null 2>&1 || die "unzip is not installed (apt install unzip)"; }
 unzip -q "$ZIP" -d "$WORK" || die "the package is not a valid zip"
@@ -150,18 +184,19 @@ ok "package: $(basename "$PKG")"
 
 # ---------------------------------------------------------------- install
 step "3. Files, menu and WhatsApp hooks"
-INSTALL_OUT="$(bash "$PKG/4-tools/agentpro-install.sh" "$SITE" 2>&1)" || { printf '%s\n' "$INSTALL_OUT" | grep -v '^   + '; die "the installer stopped (see above) — the backup is $FILES_BAK"; }
+INSTALL_OUT="$(bash "$PKG/4-tools/agentpro-install.sh" "$SITE" 2>&1)" || { printf '%s\n' "$INSTALL_OUT" | grep -v '^   + '; die "the installer stopped (see above)"; }
+CHANGED=1
+GUARD_BAK="$(ls -t "$SITE"/admin/_guard.php.agentpro-*.bak 2>/dev/null | head -1 || true)"
+WABOT_BAK="$(ls -t "$SITE"/includes/wabot.php.agentpro-*.bak 2>/dev/null | head -1 || true)"
 printf '%s\n' "$INSTALL_OUT" | grep -E '^   (Menu|WhatsApp|not done)' || true
 php -l "$SITE/admin/_guard.php" >/dev/null && php -l "$SITE/includes/wabot.php" >/dev/null || die "a PHP check failed after editing — put back the .agentpro-*.bak copies next to those files"
 grep -q "'href' => 'hub.php'" "$SITE/admin/_guard.php" || die "the menu lines were not added — paste them from $PKG/2-menu/AGENTPRO-MENU.txt, then run this again"
 grep -q 'agentpro-wa.php' "$SITE/includes/wabot.php" || die "the WhatsApp hooks were not added — see $PKG/2-menu/AGENTPRO-WABOT.txt, then run this again"
-GUARD_BAK="$(ls -t "$SITE"/admin/_guard.php.agentpro-*.bak 2>/dev/null | head -1 || true)"
-WABOT_BAK="$(ls -t "$SITE"/includes/wabot.php.agentpro-*.bak 2>/dev/null | head -1 || true)"
 ok "files copied, menu and WhatsApp hooks in place (PHP check passed)"
 
 # --------------------------------------------------------------- database
 step "4. Database ($DB_NAME): 9 new ap_* tables + settings"
-sitephp tests/apply-sql.php database/upgrade-2026-10-agent-pro.sql | tail -1 | grep -q '^done$' || die "the SQL upgrade reported an error — run: cd $SITE && php tests/apply-sql.php database/upgrade-2026-10-agent-pro.sql"
+sitephp tests/apply-sql.php database/upgrade-2026-10-agent-pro.sql | tail -1 | grep -q '^done$' || die "the SQL upgrade reported an error — see: cd $SITE && php tests/apply-sql.php database/upgrade-2026-10-agent-pro.sql"
 ok "database upgraded"
 
 # ------------------------------------------------------------------- cron
@@ -199,11 +234,12 @@ run_tests
 
 cat <<EOF
 
-To undo (only if needed) — put the two edited files back and stop the worker;
-the new pages and ap_* tables are then simply unused, and no booking is lost:
+To undo (only if needed) — put the two edited files back, stop the worker and take the
+new public pages offline; the ap_* tables stay (unused) and no booking is lost:
 ${GUARD_BAK:+  cp -p "$GUARD_BAK" "$SITE/admin/_guard.php"
 }${WABOT_BAK:+  cp -p "$WABOT_BAK" "$SITE/includes/wabot.php"
 }  crontab -u www-data -l | grep -v agentpro-worker | crontab -u www-data -
+  mkdir -p /root/agentpro-off && cd "$SITE" && mv join.php id.php c.php me api/agentpro.php api/agentpro-card.php /root/agentpro-off/
 Full backups (last resort — restoring the database would also remove anything booked since):
   $FILES_BAK
   $DB_BAK
